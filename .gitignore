@@ -1,3 +1,7 @@
 data/*
 Hallucination-Attribution/
 *venv*/
+
+# AI assistant files
+CLAUDE.md
+.claude/

@@ -23,7 +23,7 @@ _HERE       = Path(__file__).parent
 QA_FILE     = "/nobackup/le/AV_Hallucination/data/AVHBench/QA.json"
 OUTPUT_FILE = "/nobackup/le/AV_Hallucination/data/AVHBench/sampled_entities.json"
 
-SEED           = 42
+SEED  = 42
 
 TASKS = [
     "Video-driven Audio Hallucination",
@@ -37,14 +37,17 @@ class CustomDataset(Dataset):
         self.video_folder = video_folder
         self.processor = processor
         self.args = args
-
+        
     def __len__(self):
         return len(self.questions)
 
     def __getitem__(self, index):
         line = self.questions[index]
         video_path = os.path.join(self.video_folder, line["video"])
-        qs = line["question"]
+        if line["task"] == "AV Captioning":
+            qs = f"{line['question']}. Please describe the video in one full sentence."
+        else:
+            qs = f"{line['question']}. Start you answer with Yes/No and please provide a detailed explanation after that."
         modal = self.args.modal_type
 
         preprocess = self.processor['audio' if modal == "a" else "video"]
@@ -74,12 +77,12 @@ def get_dataloader(questions, args, processor):
                             collate_fn=collate_fn)
     return dataloader
 
-def extract_entity(text: str) -> Optional[str]:
+def extract_entity(text: str) -> List[str]:
     res = []
     tokens = word_tokenize(text, language='english', preserve_line=True) 
     tags = pos_tag(tokens)
     for i, (token, tag) in enumerate(tags):
-        if tag[:2] == "NN":
+        if tag[:2] == "NN" or token.lower() in ["yes", "no"]:
             res.append(token)
     return res
 
@@ -159,10 +162,13 @@ def main(args):
                 "generated_caption":      None,
                 "hallucinated_tokens":    [],
                 "non_hallucinated_tokens": [],
+                "hallucinated_entities":    [],
+                "non_hallucinated_entities": [],
             }
             results.append(record)
 
     Path(args.output_file).parent.mkdir(parents=True, exist_ok=True)
+
     with open(args.output_file, "w") as f:
         json.dump(results, f, indent=2)
 
@@ -191,8 +197,22 @@ def main(args):
 
         results[i]["generated_caption"] = output
 
-    return results
+        output_entities = extract_entity(output)
+        results[i]["generated_entities"] = output_entities
 
+        for entity in output_entities:
+            if entity in results[i]["gt_entities"]:
+                results[i]["non_hallucinated_entities"].append(entity)
+                tokens = tokenizer.encode(entity, add_special_tokens=False)
+                results[i]["non_hallucinated_tokens"].extend(tokens)
+            else:
+                results[i]["hallucinated_entities"].append(entity)
+                tokens = tokenizer.encode(entity, add_special_tokens=False)
+                results[i]["hallucinated_tokens"].extend(tokens)
+
+    
+    with open(args.output_file, "w") as f:
+        json.dump(results, f, indent=2)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
