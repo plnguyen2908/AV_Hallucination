@@ -21,7 +21,7 @@ nltk.download('averaged_perceptron_tagger_eng')
 
 _HERE       = Path(__file__).parent
 QA_FILE     = "/nobackup/le/AV_Hallucination/data/AVHBench/QA.json"
-OUTPUT_FILE = "/nobackup/le/AV_Hallucination/data/AVHBench/sampled_entities.json"
+OUTPUT_FILE = "/nobackup/le/AV_Hallucination/results/videollama2/AVHBench/sampled_entities.json"
 
 SEED  = 42
 
@@ -220,6 +220,6 @@ if __name__ == "__main__":
     parser.add_argument("--model_path", type=str, default="DAMO-NLP-SG/VideoLLaMA2.1-7B-AV")
     parser.add_argument("--modal_type", type=str, default="av")
     parser.add_argument("--video_folder", type=str, default="/nobackup/le/AV_Hallucination/data/AVHBench/videos")
-    parser.add_argument("--output_file", type=str, default="/nobackup/le/AV_Hallucination/data/AVHBench/sampled_entities.json")
+    parser.add_argument("--output_file", type=str, default="/nobackup/le/AV_Hallucination/results/videollama2/AVHBench/sampled_entities.json")
     args = parser.parse_args()
     main(args)

@@ -2,13 +2,13 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-import time
-import warnings
 from typing import List, Optional, Union
 
 import transformers
+from transformers import GenerationConfig
+from transformers.cache_utils import DynamicCache
 from transformers.generation.logits_process import LogitsProcessorList
-from transformers.generation.stopping_criteria import StoppingCriteriaList, validate_stopping_criteria
+from transformers.generation.stopping_criteria import StoppingCriteriaList
 from transformers.generation.utils import GenerateNonBeamOutput, GenerateEncoderDecoderOutput, GenerateDecoderOnlyOutput
 
 # Global variable to hold the tokenizer
@@ -18,53 +18,31 @@ def set_tokenizer(tokenizer):
     global global_tokenizer
     global_tokenizer = tokenizer
 
-def zero_ablation_greedy_search(
+def zero_ablation_sample(
     self,
     input_ids: torch.LongTensor,
-    logits_processor: Optional[LogitsProcessorList] = None,
-    stopping_criteria: Optional[StoppingCriteriaList] = None,
-    max_length: Optional[int] = None,
-    pad_token_id: Optional[int] = None,
-    eos_token_id: Optional[Union[int, List[int]]] = None,
-    output_attentions: Optional[bool] = None,
-    output_hidden_states: Optional[bool] = None,
-    output_scores: Optional[bool] = None,
-    return_dict_in_generate: Optional[bool] = None,
-    synced_gpus: bool = False,
-    streamer: Optional["BaseStreamer"] = None,
+    logits_processor: LogitsProcessorList,
+    stopping_criteria: StoppingCriteriaList,
+    generation_config: GenerationConfig,
+    synced_gpus: bool,
+    streamer: Optional["BaseStreamer"],
+    logits_warper: Optional[LogitsProcessorList] = None,
     **model_kwargs,
 ) -> Union[GenerateNonBeamOutput, torch.LongTensor]:
 
-    # init values
-    logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
-    stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
-    if max_length is not None:
-        warnings.warn(
-            "`max_length` is deprecated in this function, use"
-            " `stopping_criteria=StoppingCriteriaList([MaxLengthCriteria(max_length=max_length)])` instead.",
-            UserWarning,
-        )
-        stopping_criteria = validate_stopping_criteria(stopping_criteria, max_length)
-    pad_token_id = pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
-    eos_token_id = eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
-    if isinstance(eos_token_id, int):
-        eos_token_id = [eos_token_id]
-    eos_token_id_tensor = torch.tensor(eos_token_id).to(input_ids.device) if eos_token_id is not None else None
-    output_scores = output_scores if output_scores is not None else self.generation_config.output_scores
-    output_attentions = (
-        output_attentions if output_attentions is not None else self.generation_config.output_attentions
-    )
-    output_hidden_states = (
-        output_hidden_states if output_hidden_states is not None else self.generation_config.output_hidden_states
-    )
-    return_dict_in_generate = (
-        return_dict_in_generate
-        if return_dict_in_generate is not None
-        else self.generation_config.return_dict_in_generate
-    )
+    # init values from generation_config (mirrors _sample)
+    pad_token_id = generation_config.pad_token_id
+    output_attentions = generation_config.output_attentions
+    output_hidden_states = generation_config.output_hidden_states
+    output_scores = generation_config.output_scores
+    output_logits = generation_config.output_logits
+    return_dict_in_generate = generation_config.return_dict_in_generate
+    has_eos_stopping_criteria = any(hasattr(criteria, "eos_token_id") for criteria in stopping_criteria)
+    do_sample = generation_config.do_sample
 
     # init attention / hidden states / scores tuples
     scores = () if (return_dict_in_generate and output_scores) else None
+    raw_logits = () if (return_dict_in_generate and output_logits) else None
     decoder_attentions = () if (return_dict_in_generate and output_attentions) else None
     cross_attentions = () if (return_dict_in_generate and output_attentions) else None
     decoder_hidden_states = () if (return_dict_in_generate and output_hidden_states) else None
@@ -77,31 +55,24 @@ def zero_ablation_greedy_search(
         )
 
     # keep track of which sequences are already finished
-    unfinished_sequences = torch.ones(input_ids.shape[0], dtype=torch.long, device=input_ids.device)
-
-    this_peer_finished = False  # used by synced_gpus only
+    batch_size = input_ids.shape[0]
+    this_peer_finished = False
+    unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
+    model_kwargs = self._get_initial_cache_position(input_ids, model_kwargs)
 
     count = 0
     hallucination_influences = {}
     non_hallucination_influences = {}
     o_proj_modules = []
-    
-    # Qwen2 inside VideoLLaMA2 uses qwen2 blocks, we find o_proj
+
+    # Collect o_proj modules from Qwen2 layers inside VideoLLaMA2
     for name, module in self.model.named_modules():
         if 'o_proj' in name:
             o_proj_modules.append(module)
-            
-    # Qwen2-7B usually has 28 layers. Wait, VideoLLaMA2.1-7B might have 28 Qwen2 layers.
-    layer_num = len(o_proj_modules)
-    # Qwen2-7B has num_attention_heads = 28, hidden_size = 3584 -> head_dim = 128
-    
-    while True:
-        if synced_gpus:
-            this_peer_finished_flag = torch.tensor(0.0 if this_peer_finished else 1.0).to(input_ids.device)
-            dist.all_reduce(this_peer_finished_flag, op=dist.ReduceOp.SUM)
-            if this_peer_finished_flag.item() == 0.0:
-                break
 
+    layer_num = len(o_proj_modules)
+
+    while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
         model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
         outputs = self(
             **model_inputs,
@@ -109,48 +80,91 @@ def zero_ablation_greedy_search(
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
         )
-        next_token_logits = outputs.logits[:, -1, :]
-        next_tokens_scores = logits_processor(input_ids, next_token_logits).detach()
-        next_tokens = torch.argmax(next_tokens_scores, dim=-1).detach()
-        
-        # Note: tokenizer decode needs next_tokens as a list or tensor.
+
+        if synced_gpus and this_peer_finished:
+            continue
+
+        next_token_logits = outputs.logits[:, -1, :].clone()
+        next_token_scores = logits_processor(input_ids, next_token_logits)
+        if do_sample:
+            next_token_scores = logits_warper(input_ids, next_token_scores)
+
+        # Store scores / attentions / hidden states
+        if return_dict_in_generate:
+            if output_scores:
+                scores += (next_token_scores,)
+            if output_logits:
+                raw_logits += (next_token_logits,)
+            if output_attentions:
+                decoder_attentions += (
+                    (outputs.decoder_attentions,) if self.config.is_encoder_decoder else (outputs.attentions,)
+                )
+                if self.config.is_encoder_decoder:
+                    cross_attentions += (outputs.cross_attentions,)
+            if output_hidden_states:
+                decoder_hidden_states += (
+                    (outputs.decoder_hidden_states,)
+                    if self.config.is_encoder_decoder
+                    else (outputs.hidden_states,)
+                )
+
+        # Token selection
+        if do_sample:
+            probs = F.softmax(next_token_scores, dim=-1)
+            next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+        else:
+            next_tokens = torch.argmax(next_token_scores, dim=-1)
+
         next_word = global_tokenizer.decode(next_tokens[0]) if global_tokenizer else str(next_tokens[0].item())
-        
+
         original_probs = F.softmax(next_token_logits, dim=-1)
         original_log_probs = F.log_softmax(next_token_logits, dim=-1)
-        
-        # Qwen2 head dim is usually 128 (3584 / 28)
-        # Let's get it dynamically just in case.
+
         head_num = self.config.num_attention_heads
         head_dim = self.config.hidden_size // head_num
 
-        def custom_hook(module, input, layer_idx, head_idx):
-            ablated_input = input[0]
-            ablated_input[:,:,head_dim * head_idx : head_dim * (head_idx+1)] = 0
-            return (ablated_input, )  
-
         def attach_custom_hook(layer_idx, head_idx):
             def hook_fn(module, input):
-                return custom_hook(module, input, layer_idx, head_idx)
+                ablated = input[0].clone()
+                ablated[:, :, head_dim * head_idx: head_dim * (head_idx + 1)] = 0
+                return (ablated,)
             return hook_fn
 
-        # Look in kwargs for tokens we want to attribute
-        target_tokens = model_kwargs.get('hallucinated_tokens', []) + model_kwargs.get('non_hallucinated_tokens', [])
+        # Run zero-ablation only for target tokens
+        hallucinated_tokens = model_kwargs.get('hallucinated_tokens', [])
+        non_hallucinated_tokens = model_kwargs.get('non_hallucinated_tokens', [])
+        target_tokens = hallucinated_tokens + non_hallucinated_tokens
         is_target = next_word in target_tokens or next_tokens[0].item() in target_tokens
-        
+
         if is_target:
-            influences = [[[] for _ in range(head_num)] for _ in range(layer_num)]
+            # DynamicCache is mutable — each ablation forward appends to it in-place.
+            # Save the current sequence lengths and restore before every ablation pass.
+            pkv = model_inputs.get('past_key_values')
+            if isinstance(pkv, DynamicCache) and len(pkv.key_cache) > 0:
+                orig_lengths = [pkv.key_cache[i].shape[2] for i in range(len(pkv.key_cache))]
+            else:
+                orig_lengths = None
+
+            influences = [[None for _ in range(head_num)] for _ in range(layer_num)]
             for layer_idx in range(layer_num):
                 o_proj_module = o_proj_modules[layer_idx]
                 for head_idx in range(head_num):
-                    hook_handle = o_proj_module.register_forward_pre_hook(attach_custom_hook(layer_idx, head_idx))
-                    
+                    if orig_lengths is not None:
+                        for i, L in enumerate(orig_lengths):
+                            pkv.key_cache[i] = pkv.key_cache[i][:, :, :L, :]
+                            pkv.value_cache[i] = pkv.value_cache[i][:, :, :L, :]
+
+                    hook_handle = o_proj_module.register_forward_pre_hook(
+                        attach_custom_hook(layer_idx, head_idx)
+                    )
                     outputs_ablated = self(
                         **model_inputs,
                         return_dict=True,
-                        output_attentions=True,
-                        output_hidden_states=True,
+                        output_attentions=False,
+                        output_hidden_states=False,
                     )
+                    hook_handle.remove()
+
                     next_token_logits_ablated = outputs_ablated.logits[:, -1, :]
                     ablated_probs = F.softmax(next_token_logits_ablated, dim=-1)
                     ablated_log_probs = F.log_softmax(next_token_logits_ablated, dim=-1)
@@ -162,70 +176,49 @@ def zero_ablation_greedy_search(
                         influence = (original_probs[0, next_tokens[0]] - ablated_probs[0, next_tokens[0]]).abs().item()
                     elif inf_score_type == 'log_prob_diff':
                         influence = (original_log_probs[0, next_tokens[0]] - ablated_log_probs[0, next_tokens[0]]).item()
-                    
+                    else:
+                        influence = (original_probs[0, next_tokens[0]] - ablated_probs[0, next_tokens[0]]).item()
+
                     influences[layer_idx][head_idx] = {
-                        'original_prob': original_probs[0, next_tokens[0]].item(),
-                        'perturbed_prob': ablated_probs[0, next_tokens[0]].item(),
-                        'original_log_prob': original_log_probs[0, next_tokens[0]].item(),
+                        'original_prob':      original_probs[0, next_tokens[0]].item(),
+                        'perturbed_prob':     ablated_probs[0, next_tokens[0]].item(),
+                        'original_log_prob':  original_log_probs[0, next_tokens[0]].item(),
                         'perturbed_log_prob': ablated_log_probs[0, next_tokens[0]].item(),
-                        'influence': influence
+                        'influence':          influence,
                     }
-                    hook_handle.remove()
 
             key = f'{next_word}_{count}'
-            if next_word in model_kwargs.get('hallucinated_tokens', []) or next_tokens[0].item() in model_kwargs.get('hallucinated_tokens', []):
+            if next_word in hallucinated_tokens or next_tokens[0].item() in hallucinated_tokens:
                 hallucination_influences[key] = influences
-            elif next_word in model_kwargs.get('non_hallucinated_tokens', []) or next_tokens[0].item() in model_kwargs.get('non_hallucinated_tokens', []):
+            elif next_word in non_hallucinated_tokens or next_tokens[0].item() in non_hallucinated_tokens:
                 non_hallucination_influences[key] = influences
+
+            # Final restore after all ablation passes
+            if orig_lengths is not None:
+                for i, L in enumerate(orig_lengths):
+                    pkv.key_cache[i] = pkv.key_cache[i][:, :, :L, :]
+                    pkv.value_cache[i] = pkv.value_cache[i][:, :, :L, :]
 
             torch.cuda.empty_cache()
 
-        if synced_gpus and this_peer_finished:
-            continue  
-        
-        count+=1
-        if return_dict_in_generate:
-            if output_scores:
-                scores += (next_tokens_scores,)
-            if output_attentions:
-                decoder_attentions += (
-                    (outputs.decoder_attentions,) if self.config.is_encoder_decoder else (outputs.attentions,)
-                )
-                if self.config.is_encoder_decoder:
-                    cross_attentions += (outputs.cross_attentions,)
+        count += 1
 
-            if output_hidden_states:
-                decoder_hidden_states += (
-                    (outputs.decoder_hidden_states,)
-                    if self.config.is_encoder_decoder
-                    else (outputs.hidden_states,)
-                )
-
-        if eos_token_id is not None:
-            if pad_token_id is None:
-                raise ValueError("If `eos_token_id` is defined, make sure that `pad_token_id` is defined.")
+        # Finish sequences that hit eos
+        if has_eos_stopping_criteria:
             next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
 
         input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
         if streamer is not None:
             streamer.put(next_tokens.cpu())
-            
+
         model_kwargs = self._update_model_kwargs_for_generation(
             outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
         )
 
-        if eos_token_id_tensor is not None:
-            unfinished_sequences = unfinished_sequences.mul(
-                next_tokens.tile(eos_token_id_tensor.shape[0], 1).ne(eos_token_id_tensor.unsqueeze(1)).prod(dim=0)
-            )
-            if unfinished_sequences.max() == 0:
-                this_peer_finished = True
+        unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, scores)
+        this_peer_finished = unfinished_sequences.max() == 0
 
-        if stopping_criteria(input_ids, scores):
-            this_peer_finished = True
-
-        if this_peer_finished and not synced_gpus:
-            break
+        del outputs
 
     if streamer is not None:
         streamer.end()
@@ -235,6 +228,7 @@ def zero_ablation_greedy_search(
             return GenerateEncoderDecoderOutput(
                 sequences=input_ids,
                 scores=scores,
+                logits=raw_logits,
                 encoder_attentions=encoder_attentions,
                 encoder_hidden_states=encoder_hidden_states,
                 decoder_attentions=decoder_attentions,
@@ -246,6 +240,7 @@ def zero_ablation_greedy_search(
             return GenerateDecoderOnlyOutput(
                 sequences=input_ids,
                 scores=scores,
+                logits=raw_logits,
                 attentions=decoder_attentions,
                 hidden_states=decoder_hidden_states,
                 past_key_values=model_kwargs.get("past_key_values"),
@@ -253,7 +248,7 @@ def zero_ablation_greedy_search(
     else:
         return input_ids
 
+
 def set_zero_ablation_greedy_search(tokenizer):
     set_tokenizer(tokenizer)
-    transformers.generation.utils.GenerationMixin.greedy_search = zero_ablation_greedy_search
-
+    transformers.generation.utils.GenerationMixin._sample = zero_ablation_sample
