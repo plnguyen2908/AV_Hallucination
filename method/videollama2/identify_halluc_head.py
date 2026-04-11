@@ -232,7 +232,9 @@ def contrastive_score(args):
     for file in files:
         if file.endswith("pth"):
             if file.startswith("hal"):
-                hallucination_sample = torch.load(os.path.join(args.output_path, file))
+                hallucination_sample = torch.load(
+                    os.path.join(args.output_path, "pth", file)
+                )
                 influences = []
                 for _, v in hallucination_sample.items():
                     influence = torch.zeros(args.layer_num, args.head_num)
@@ -245,7 +247,7 @@ def contrastive_score(args):
                 hallucination_samples += influences
             else:
                 non_hallucination_sample = torch.load(
-                    os.path.join(args.output_path, file)
+                    os.path.join(args.output_path, "pth", file)
                 )
                 influences = []
                 for _, v in non_hallucination_sample.items():
