@@ -36,7 +36,7 @@ def main(args):
     disable_torch_init()
     model_path = os.path.expanduser(args.model_path)
 
-    model, processor, tokenizer = model_init(model_path)
+    model, processor, tokenizer = model_init(model_path, attn_implementation="eager")
     set_zero_ablation_greedy_search(tokenizer)
 
     with open(args.input_file, "r") as f:
