@@ -222,9 +222,10 @@ def main(args):
                 f"{args.output_path}/images/non_hallucination_influences_{question_id}.png"
             )
             plt.close(fig)
+    return layer_num, head_num
 
 
-def contrastive_score(args):
+def contrastive_score(args, layer_num, head_num):
 
     files = os.listdir(os.path.join(args.output_path, "pth"))
     hallucination_samples = []
@@ -237,9 +238,9 @@ def contrastive_score(args):
                 )
                 influences = []
                 for _, v in hallucination_sample.items():
-                    influence = torch.zeros(args.layer_num, args.head_num)
-                    for layer_idx in range(args.layer_num):
-                        for head_idx in range(args.head_num):
+                    influence = torch.zeros(layer_num, head_num)
+                    for layer_idx in range(layer_num):
+                        for head_idx in range(head_num):
                             influence[layer_idx][head_idx] = v[layer_idx][head_idx][
                                 "influence"
                             ]
@@ -251,9 +252,9 @@ def contrastive_score(args):
                 )
                 influences = []
                 for _, v in non_hallucination_sample.items():
-                    influence = torch.zeros(args.layer_num, args.head_num)
-                    for layer_idx in range(args.layer_num):
-                        for head_idx in range(args.head_num):
+                    influence = torch.zeros(layer_num, head_num)
+                    for layer_idx in range(layer_num):
+                        for head_idx in range(head_num):
                             influence[layer_idx][head_idx] = v[layer_idx][head_idx][
                                 "influence"
                             ]
@@ -318,5 +319,5 @@ if __name__ == "__main__":
     parser.add_argument("--influence_score", type=str, default="prob_diff")
     parser.add_argument("--topk", type=int, default=30)
     args = parser.parse_args()
-    main(args)
-    contrastive_score(args)
+    layer_num, head_num = main(args)
+    contrastive_score(args, layer_num, head_num)
