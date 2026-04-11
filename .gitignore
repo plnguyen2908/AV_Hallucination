@@ -1,6 +1,3 @@
 data/*
 *venv*/
 
-# AI assistant files
-CLAUDE.md
-.claude/
