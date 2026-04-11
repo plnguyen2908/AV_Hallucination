@@ -43,6 +43,9 @@ def main(args):
         samples = json.load(f)
 
     os.makedirs(args.output_path, exist_ok=True)
+    os.makedirs(f"{args.output_path}/images", exist_ok=True)
+    os.makedirs(f"{args.output_path}/pth", exist_ok=True)
+    os.makedirs(f"{args.output_path}/heads", exist_ok=True)
     layer_num = model.config.num_hidden_layers
     head_num = model.config.num_attention_heads
 
@@ -159,13 +162,15 @@ def main(args):
         torch.save(
             hallucination_influences,
             os.path.join(
-                args.output_path, f"hallucination_influences_{question_id}.pth"
+                args.output_path, "pth", f"hallucination_influences_{question_id}.pth"
             ),
         )
         torch.save(
             non_hallucination_influences,
             os.path.join(
-                args.output_path, f"non_hallucination_influences_{question_id}.pth"
+                args.output_path,
+                "pth",
+                f"non_hallucination_influences_{question_id}.pth",
             ),
         )
         torch.cuda.empty_cache()
@@ -190,7 +195,7 @@ def main(args):
             ax.set_xlabel("Head")
             ax.set_ylabel("Layer")
             fig.savefig(
-                f"{args.output_path}/hallucination_influences_{question_id}.png"
+                f"{args.output_path}/images/hallucination_influences_{question_id}.png"
             )
             plt.close(fig)
 
@@ -214,9 +219,77 @@ def main(args):
             ax.set_xlabel("Head")
             ax.set_ylabel("Layer")
             fig.savefig(
-                f"{args.output_path}/non_hallucination_influences_{question_id}.png"
+                f"{args.output_path}/images/non_hallucination_influences_{question_id}.png"
             )
             plt.close(fig)
+
+
+def contrastive_score(args):
+
+    files = os.listdir(os.path.join(args.output_path, "pth"))
+    hallucination_samples = []
+    non_hallucination_samples = []
+    for file in files:
+        if file.endswith("pth"):
+            if file.startswith("hal"):
+                hallucination_sample = torch.load(os.path.join(args.output_path, file))
+                influences = []
+                for _, v in hallucination_sample.items():
+                    influence = torch.zeros(args.layer_num, args.head_num)
+                    for layer_idx in range(args.layer_num):
+                        for head_idx in range(args.head_num):
+                            influence[layer_idx][head_idx] = v[layer_idx][head_idx][
+                                "influence"
+                            ]
+                    influences.append(influence)
+                hallucination_samples += influences
+            else:
+                non_hallucination_sample = torch.load(
+                    os.path.join(args.output_path, file)
+                )
+                influences = []
+                for _, v in non_hallucination_sample.items():
+                    influence = torch.zeros(args.layer_num, args.head_num)
+                    for layer_idx in range(args.layer_num):
+                        for head_idx in range(args.head_num):
+                            influence[layer_idx][head_idx] = v[layer_idx][head_idx][
+                                "influence"
+                            ]
+                    influences.append(influence)
+                non_hallucination_samples += influences
+
+    hallucinated_scores = torch.stack(hallucination_samples)
+    non_hallucinated_scores = torch.stack(non_hallucination_samples)
+
+    plt.figure(figsize=(8, 8))
+    difference = (
+        torch.mean(hallucinated_scores, 0).float()
+        - torch.mean(non_hallucinated_scores, 0).float()
+    )
+    ax = sns.heatmap(difference.cpu().numpy(), cmap="coolwarm", center=0)
+    ax.set_xlabel("Head Index", fontsize=12)
+    ax.set_ylabel("Layer Index", fontsize=12)
+    print(f"{args.output_path}/images/constrastive_influences.png")
+    plt.savefig(f"{args.output_path}/images/constrastive_influences.png")
+
+    results = {}
+    _, flat_indices = torch.topk(difference.flatten(), args.topk, largest=True)
+    indices = [
+        [flat_indice.numpy() // 32, flat_indice.numpy() % 32]
+        for flat_indice in flat_indices
+    ]
+    results.update({"hal_heads": indices})
+    _, flat_indices = torch.topk(difference.flatten(), args.topk, largest=False)
+    indices = [
+        [flat_indice.numpy() // 32, flat_indice.numpy() % 32]
+        for flat_indice in flat_indices
+    ]
+    results.update({"non_hal_heads": indices})
+    print(results)
+
+    print(f"{args.output_path}/heads/attribution_result.json")
+    with open(f"{args.output_path}/heads/attribution_result.json", "w") as file:
+        json.dump(results, file, default=json_custom_serializer)
 
 
 if __name__ == "__main__":
@@ -241,5 +314,7 @@ if __name__ == "__main__":
         default="/nobackup/le/AV_Hallucination/results/videollama2/AVHBench/attribution",
     )
     parser.add_argument("--influence_score", type=str, default="prob_diff")
+    parser.add_argument("--topk", type=int, default=30)
     args = parser.parse_args()
     main(args)
+    contrastive_score(args)
