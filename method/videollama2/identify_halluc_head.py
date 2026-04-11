@@ -140,7 +140,7 @@ def main(args):
                 use_cache=True,
                 stopping_criteria=[stopping_criteria],
                 pad_token_id=tokenizer.eos_token_id,
-                output_attentions=True,
+                output_attentions=False,
                 return_dict_in_generate=True,
                 hallucinated_tokens=hallucinated_tokens,
                 non_hallucinated_tokens=non_hallucinated_tokens,
