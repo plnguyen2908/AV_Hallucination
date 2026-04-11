@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 MODEL_PATH="DAMO-NLP-SG/VideoLLaMA2.1-7B-AV"
 MODAL_TYPE="av"
-N_PER_CATEGORY=100
+N_PER_CATEGORY=300
 VIDEO_FOLDER="$ROOT_DIR/data/AVHBench/videos"
 OUTPUT_FILE="$ROOT_DIR/results/videollama2/AVHBench/sampled_entities.json"
 QA_FILE="$ROOT_DIR/data/AVHBench/QA.json"
