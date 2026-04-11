@@ -1,35 +1,36 @@
+import argparse
 import json
+import os
 import random
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Set
+
 import nltk
-from nltk import word_tokenize, pos_tag
-import argparse
-
-from torch.utils.data import Dataset, DataLoader
-
-from videollama2 import model_init, mm_infer
+import tqdm
+from nltk import pos_tag, word_tokenize
+from torch.utils.data import DataLoader, Dataset
 from videollama2.utils import disable_torch_init
 
-import os
-import tqdm
+from videollama2 import mm_infer, model_init
+
+nltk.download("averaged_perceptron_tagger_eng")
 
 
-nltk.download('averaged_perceptron_tagger_eng')
+_HERE = Path(__file__).parent
+# QA_FILE     = "/nobackup/le/AV_Hallucination/data/AVHBench/QA.json"
+OUTPUT_FILE = (
+    "/nobackup/le/AV_Hallucination/results/videollama2/AVHBench/sampled_entities.json"
+)
 
-
-_HERE       = Path(__file__).parent
-QA_FILE     = "/nobackup/le/AV_Hallucination/data/AVHBench/QA.json"
-OUTPUT_FILE = "/nobackup/le/AV_Hallucination/results/videollama2/AVHBench/sampled_entities.json"
-
-SEED  = 42
+SEED = 42
 
 TASKS = [
     "Video-driven Audio Hallucination",
     "Audio-driven Video Hallucination",
-    "AV Captioning"
+    "AV Captioning",
 ]
+
 
 class CustomDataset(Dataset):
     def __init__(self, questions, video_folder, processor, args):
@@ -37,7 +38,7 @@ class CustomDataset(Dataset):
         self.video_folder = video_folder
         self.processor = processor
         self.args = args
-        
+
     def __len__(self):
         return len(self.questions)
 
@@ -50,36 +51,40 @@ class CustomDataset(Dataset):
             qs = f"{line['question']}. Start you answer with Yes/No and please provide a detailed explanation after that."
         modal = self.args.modal_type
 
-        preprocess = self.processor['audio' if modal == "a" else "video"]
+        preprocess = self.processor["audio" if modal == "a" else "video"]
         try:
-            audio_video_tensor = preprocess(video_path, va=True if modal == "av" else False)
+            audio_video_tensor = preprocess(
+                video_path, va=True if modal == "av" else False
+            )
         except Exception:
             print(f"video read error: {video_path}")
             audio_video_tensor = None
 
         return {
-            'audio_video': audio_video_tensor,
-            'question':    qs,
-            'modal':       'audio' if modal == 'a' else "video",
+            "audio_video": audio_video_tensor,
+            "question": qs,
+            "modal": "audio" if modal == "a" else "video",
         }
 
 
 def collate_fn(batch):
-    aud_vid   = [x['audio_video'] for x in batch]
-    questions = [x['question']    for x in batch]
-    modals    = [x['modal']       for x in batch]
+    aud_vid = [x["audio_video"] for x in batch]
+    questions = [x["question"] for x in batch]
+    modals = [x["modal"] for x in batch]
     return aud_vid, questions, modals
 
 
 def get_dataloader(questions, args, processor):
     dataset = CustomDataset(questions, args.video_folder, processor, args)
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=False, drop_last=False,
-                            collate_fn=collate_fn)
+    dataloader = DataLoader(
+        dataset, batch_size=1, shuffle=False, drop_last=False, collate_fn=collate_fn
+    )
     return dataloader
+
 
 def extract_entity(text: str) -> List[str]:
     res = []
-    tokens = word_tokenize(text, language='english', preserve_line=True) 
+    tokens = word_tokenize(text, language="english", preserve_line=True)
     tags = pos_tag(tokens)
     for i, (token, tag) in enumerate(tags):
         if tag[:2] == "NN" or token.lower() in ["yes", "no"]:
@@ -92,8 +97,8 @@ def get_entity_labels_for_entry(entry: dict) -> dict:
         "gt_entities": [],
     }
 
-    task  = entry["task"]
-    text  = entry["text"]
+    task = entry["task"]
+    text = entry["text"]
     label = entry["label"].strip()
 
     if task == "Video-driven Audio Hallucination":
@@ -123,7 +128,7 @@ def main(args):
     random.seed(SEED)
     disable_torch_init()
 
-    with open(QA_FILE) as f:
+    with open(args.QA_FILE) as f:
         all_qa: List[dict] = json.load(f)
 
     by_task: Dict[str, List[dict]] = defaultdict(list)
@@ -153,16 +158,16 @@ def main(args):
             entity_labels = get_entity_labels_for_entry(entry)
 
             record = {
-                "question_id":            entry["question_id"],
-                "video":                  f"{video}.mp4",
-                "task":                   task,
-                "question":               entry["text"],
-                "answer":                  entry["label"],
+                "question_id": entry["question_id"],
+                "video": f"{video}.mp4",
+                "task": task,
+                "question": entry["text"],
+                "answer": entry["label"],
                 **entity_labels,
-                "generated_caption":      None,
-                "hallucinated_tokens":    [],
+                "generated_caption": None,
+                "hallucinated_tokens": [],
                 "non_hallucinated_tokens": [],
-                "hallucinated_entities":    [],
+                "hallucinated_entities": [],
                 "non_hallucinated_entities": [],
             }
             results.append(record)
@@ -177,10 +182,12 @@ def main(args):
 
     dataloader = get_dataloader(results, args, processor)
 
-    for i, (aud_vid_tensors, questions, modals) in tqdm.tqdm(enumerate(dataloader), total=len(results)):
+    for i, (aud_vid_tensors, questions, modals) in tqdm.tqdm(
+        enumerate(dataloader), total=len(results)
+    ):
         audio_video_tensor = aud_vid_tensors[0]
-        question           = questions[0]
-        modal              = modals[0]
+        question = questions[0]
+        modal = modals[0]
 
         try:
             output = mm_infer(
@@ -192,7 +199,9 @@ def main(args):
                 do_sample=False,
             )
         except Exception:
-            import traceback; traceback.print_exc()
+            import traceback
+
+            traceback.print_exc()
             output = "error"
 
         results[i]["generated_caption"] = output
@@ -210,16 +219,31 @@ def main(args):
                 tokens = tokenizer.encode(entity, add_special_tokens=False)
                 results[i]["hallucinated_tokens"].extend(tokens)
 
-    
     with open(args.output_file, "w") as f:
         json.dump(results, f, indent=2)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--n_per_category", type=int, default=100)
-    parser.add_argument("--model_path", type=str, default="DAMO-NLP-SG/VideoLLaMA2.1-7B-AV")
+    parser.add_argument(
+        "--model_path", type=str, default="DAMO-NLP-SG/VideoLLaMA2.1-7B-AV"
+    )
     parser.add_argument("--modal_type", type=str, default="av")
-    parser.add_argument("--video_folder", type=str, default="/nobackup/le/AV_Hallucination/data/AVHBench/videos")
-    parser.add_argument("--output_file", type=str, default="/nobackup/le/AV_Hallucination/results/videollama2/AVHBench/sampled_entities.json")
+    parser.add_argument(
+        "--video_folder",
+        type=str,
+        default="/nobackup/le/AV_Hallucination/data/AVHBench/videos",
+    )
+    parser.add_argument(
+        "--output_file",
+        type=str,
+        default="/nobackup/le/AV_Hallucination/results/videollama2/AVHBench/sampled_entities.json",
+    )
+    parser.add_argument(
+        "--QA_FILE",
+        type=str,
+        default="/nobackup3/le/AV_Hallucination/data/AVHBench/QA.json",
+    )
     args = parser.parse_args()
     main(args)
