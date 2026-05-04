@@ -156,7 +156,7 @@ def process_audio_file(wav_path):
     # beats
     raw_wav = torch.from_numpy(wav).to('cpu')
     waveform = raw_wav.unsqueeze(0) * 2 ** 15
-    fbank = ta_kaldi.fbank(waveform, num_mel_bins=128, sample_frequency=16000, frame_length=25, frame_shift=10).to(torch.bfloat16)
+    fbank = ta_kaldi.fbank(waveform, num_mel_bins=128, sample_frequency=16000, frame_length=25, frame_shift=10).to(torch.float16)
     return fbank.unsqueeze(0)
 
 def get_clip_timepoints(clip_sampler, duration):
@@ -235,7 +235,7 @@ def process_audio_from_video(audio_path, clip_duration, device="cpu", num_mel_bi
         pad_length = 30 * sr - len(wav)
         wav = torch.nn.functional.pad(wav, (0, pad_length), mode='constant', value=0.0)
     waveform = wav.unsqueeze(0) * 2 ** 15
-    fbank = ta_kaldi.fbank(waveform, num_mel_bins=128, sample_frequency=16000, frame_length=25, frame_shift=10).to(torch.bfloat16)
+    fbank = ta_kaldi.fbank(waveform, num_mel_bins=128, sample_frequency=16000, frame_length=25, frame_shift=10).to(torch.float16)
     return fbank.unsqueeze(0)
 
 

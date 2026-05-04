@@ -1,24 +1,21 @@
 import argparse
 import json
 import os
+import shutil
 
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
 import torch
-
-# Import the custom monkey patch for head attribution
-from head_attribution import set_zero_ablation_greedy_search
+from head_attribution import *
 from tqdm import tqdm
+from videollama2 import model_init
 from videollama2.constants import (
     DEFAULT_AUDIO_TOKEN,
-    DEFAULT_IMAGE_TOKEN,
     DEFAULT_VIDEO_TOKEN,
 )
 from videollama2.mm_utils import KeywordsStoppingCriteria, tokenizer_multimodal_token
 from videollama2.utils import disable_torch_init
-
-from videollama2 import model_init
 
 
 def json_custom_serializer(obj):
@@ -32,20 +29,36 @@ def json_custom_serializer(obj):
         raise TypeError("Type %s not serializable" % type(obj))
 
 
+def _dims_from_pth(pth_dir: str):
+    """Infer (layer_num, head_num) from a saved influence pth file."""
+    for fname in os.listdir(pth_dir):
+        if not fname.endswith(".pth"):
+            continue
+        data = torch.load(os.path.join(pth_dir, fname), weights_only=False)
+        if not data:
+            continue
+        v = next(iter(data.values()))  # list[layer][head] of dicts
+        return len(v), len(v[0])
+    raise RuntimeError(f"No usable pth files found in {pth_dir}")
+
+
 def main(args):
+
+    if args.skip:
+        return _dims_from_pth(os.path.join(args.output_path, "pth"))
+
+    shutil.rmtree(args.output_path, ignore_errors=True)
+    os.makedirs(f"{args.output_path}/images")
+    os.makedirs(f"{args.output_path}/pth")
+    os.makedirs(f"{args.output_path}/heads")
+
     disable_torch_init()
     model_path = os.path.expanduser(args.model_path)
-
-    model, processor, tokenizer = model_init(model_path, attn_implementation="eager")
-    set_zero_ablation_greedy_search(tokenizer)
+    model, processor, tokenizer = model_init(model_path)
 
     with open(args.input_file, "r") as f:
         samples = json.load(f)
 
-    os.makedirs(args.output_path, exist_ok=True)
-    os.makedirs(f"{args.output_path}/images", exist_ok=True)
-    os.makedirs(f"{args.output_path}/pth", exist_ok=True)
-    os.makedirs(f"{args.output_path}/heads", exist_ok=True)
     layer_num = model.config.num_hidden_layers
     head_num = model.config.num_attention_heads
 
@@ -55,45 +68,60 @@ def main(args):
         task = line["task"]
         prompt = line["question"]
 
-        if task == "AV Captioning":
-            qs = f"{prompt}. Please describe the video in one full sentence."
+        if "Captioning" in task:
+            qs = prompt
         else:
             qs = f"{prompt}. Start you answer with Yes/No and please provide a detailed explanation after that."
 
-        modal = args.modal_type
+        modal = args.modal_type  # "av", "v", or "a"
 
-        preprocess = processor["audio" if modal == "a" else "video"]
+        # --- modal-dependent preprocessing ---
+        if modal == "a":
+            preprocess = processor["audio"]
+            modal_token = DEFAULT_AUDIO_TOKEN
+            modal_str = "audio"
+        elif modal == "v":
+            preprocess = processor["video"]
+            modal_token = DEFAULT_VIDEO_TOKEN
+            modal_str = "video"
+        else:  # "av"
+            preprocess = processor["video"]
+            modal_token = DEFAULT_VIDEO_TOKEN
+            modal_str = "video"
+
         try:
-            audio_video_tensor = preprocess(
-                video_path, va=True if modal == "av" else False
-            )
+            if modal != "a":
+                audio_video_tensor = preprocess(video_path, va=(modal == "av"))
+            else:
+                audio_video_tensor = preprocess(video_path)
+            assert audio_video_tensor is not None
         except Exception:
             print(f"video read error: {video_path}")
             continue
 
-        hallucinated_tokens = line.get("hallucinated_tokens", [])
-        non_hallucinated_tokens = line.get("non_hallucinated_tokens", [])
+        hallucinated_entities = line.get("hallucinated_entities", [])
+        non_hallucinated_entities = line.get("non_hallucinated_entities", [])
 
-        if not hallucinated_tokens and not non_hallucinated_tokens:
-            print(f"Skipping {question_id} format")
+        set_zero_ablation_greedy_search(
+            tokenizer,
+            hallucinated_entities,
+            non_hallucinated_entities,
+            args.influence_score,
+        )
+        if not hallucinated_entities:
+            print(f"Skipping {question_id} - no hallucinated entities")
             continue
 
-        modal = "audio" if modal == "a" else "video"
-        # Preprocessing from mm_infer
-        if modal == "image":
-            modal_token = DEFAULT_IMAGE_TOKEN
-        elif modal == "video":
-            modal_token = DEFAULT_VIDEO_TOKEN
-        elif modal == "audio":
-            modal_token = DEFAULT_AUDIO_TOKEN
-        else:
-            modal_token = ""
-
         if isinstance(audio_video_tensor, dict):
-            tensor = {k: v.half().cuda() for k, v in audio_video_tensor.items()}
+            tensor = {
+                k: v.to(torch.float16 if k == "audio" else torch.bfloat16).cuda()
+                for k, v in audio_video_tensor.items()
+            }
+        elif modal == "a":
+            tensor = audio_video_tensor.to(torch.float16).cuda()
         else:
-            tensor = audio_video_tensor.half().cuda()
-        tensor = [(tensor, modal)]
+            tensor = audio_video_tensor.to(torch.bfloat16).cuda()
+        tensor = [(tensor, modal_str)]
 
         message = [{"role": "user", "content": modal_token + "\n" + qs}]
 
@@ -106,7 +134,9 @@ def main(args):
                 {
                     "role": "system",
                     "content": (
-                        "<<SYS>>\nYou are a helpful, respectful and honest assistant. ... <</SYS>>"
+                        "<<SYS>>\nYou are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature."
+                        "\n"
+                        "If a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information.\n<</SYS>>"
                     ),
                 }
             ]
@@ -136,18 +166,15 @@ def main(args):
                 attention_mask=attention_masks,
                 images=tensor,
                 do_sample=False,
+                temperature=0.0,
                 max_new_tokens=2048,
+                top_p=0.9,
                 use_cache=True,
                 stopping_criteria=[stopping_criteria],
                 pad_token_id=tokenizer.eos_token_id,
                 output_attentions=False,
-                return_dict_in_generate=True,
-                hallucinated_tokens=hallucinated_tokens,
-                non_hallucinated_tokens=non_hallucinated_tokens,
-                influence_score=args.influence_score,
             )
 
-            # The custom greedy_search returns the tuple, so outputs should be a tuple length 3
             if isinstance(outputs, tuple) and len(outputs) == 3:
                 (
                     generate_outputs,
@@ -158,7 +185,17 @@ def main(args):
                 print(f"Failed to get influences for {question_id}, moving on...")
                 continue
 
-        # Save influence data per question
+            generated_text = tokenizer.batch_decode(
+                generate_outputs, skip_special_tokens=True
+            )[0].strip()
+
+            expected_text = line.get("generated_caption", "").strip()
+            assert generated_text == expected_text, (
+                f"Output mismatch for {question_id}:\n"
+                f"  expected: {expected_text!r}\n"
+                f"  got:      {generated_text!r}"
+            )
+
         torch.save(
             hallucination_influences,
             os.path.join(
@@ -184,7 +221,7 @@ def main(args):
                         influence[layer_idx][head_idx] = v[layer_idx][head_idx][
                             "influence"
                         ]
-                influences.append(influence)
+                influences.append(torch.nan_to_num(influence, nan=0.0))
             fig, ax = plt.subplots(figsize=(8, 8))
             sns.heatmap(
                 torch.mean(torch.stack(influences), 0).cpu().numpy(),
@@ -208,7 +245,7 @@ def main(args):
                         influence[layer_idx][head_idx] = v[layer_idx][head_idx][
                             "influence"
                         ]
-                influences.append(influence)
+                influences.append(torch.nan_to_num(influence, nan=0.0))
             fig, ax = plt.subplots(figsize=(8, 8))
             sns.heatmap(
                 torch.mean(torch.stack(influences), 0).cpu().numpy(),
@@ -222,11 +259,11 @@ def main(args):
                 f"{args.output_path}/images/non_hallucination_influences_{question_id}.png"
             )
             plt.close(fig)
+
     return layer_num, head_num
 
 
 def contrastive_score(args, layer_num, head_num):
-
     files = os.listdir(os.path.join(args.output_path, "pth"))
     hallucination_samples = []
     non_hallucination_samples = []
@@ -236,6 +273,8 @@ def contrastive_score(args, layer_num, head_num):
                 hallucination_sample = torch.load(
                     os.path.join(args.output_path, "pth", file)
                 )
+                if not hallucination_sample:
+                    continue
                 influences = []
                 for _, v in hallucination_sample.items():
                     influence = torch.zeros(layer_num, head_num)
@@ -244,12 +283,14 @@ def contrastive_score(args, layer_num, head_num):
                             influence[layer_idx][head_idx] = v[layer_idx][head_idx][
                                 "influence"
                             ]
-                    influences.append(influence)
+                    influences.append(torch.nan_to_num(influence, nan=0.0))
                 hallucination_samples += influences
             else:
                 non_hallucination_sample = torch.load(
                     os.path.join(args.output_path, "pth", file)
                 )
+                if not non_hallucination_sample:
+                    continue
                 influences = []
                 for _, v in non_hallucination_sample.items():
                     influence = torch.zeros(layer_num, head_num)
@@ -258,41 +299,61 @@ def contrastive_score(args, layer_num, head_num):
                             influence[layer_idx][head_idx] = v[layer_idx][head_idx][
                                 "influence"
                             ]
-                    influences.append(influence)
+                    influences.append(torch.nan_to_num(influence, nan=0.0))
                 non_hallucination_samples += influences
 
     hallucinated_scores = torch.stack(hallucination_samples)
     non_hallucinated_scores = torch.stack(non_hallucination_samples)
 
-    plt.figure(figsize=(8, 8))
-    difference = (
-        torch.mean(hallucinated_scores, 0).float()
-        - torch.mean(non_hallucinated_scores, 0).float()
-    )
-    ax = sns.heatmap(difference.cpu().numpy(), cmap="coolwarm", center=0)
+    mean_hal = torch.mean(hallucinated_scores, 0).float()
+    mean_non_hal = torch.mean(non_hallucinated_scores, 0).float()
+    difference = mean_hal - mean_non_hal
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    sns.heatmap(mean_hal.cpu().numpy(), cmap="coolwarm", center=0, ax=ax)
     ax.set_xlabel("Head Index", fontsize=12)
     ax.set_ylabel("Layer Index", fontsize=12)
-    print(f"{args.output_path}/images/constrastive_influences.png")
-    plt.savefig(f"{args.output_path}/images/constrastive_influences.png")
+    ax.set_title("Mean Hallucination Influence")
+    fig.savefig(f"{args.output_path}/images/mean_hallucination_influences.png")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    sns.heatmap(mean_non_hal.cpu().numpy(), cmap="coolwarm", center=0, ax=ax)
+    ax.set_xlabel("Head Index", fontsize=12)
+    ax.set_ylabel("Layer Index", fontsize=12)
+    ax.set_title("Mean Non-Hallucination Influence")
+    fig.savefig(f"{args.output_path}/images/mean_non_hallucination_influences.png")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    sns.heatmap(difference.cpu().numpy(), cmap="coolwarm", center=0, ax=ax)
+    ax.set_xlabel("Head Index", fontsize=12)
+    ax.set_ylabel("Layer Index", fontsize=12)
+    ax.set_title("Contrastive Influence (Hal - Non-Hal)")
+    fig.savefig(f"{args.output_path}/images/contrastive_influences.png")
+    plt.close(fig)
 
     results = {}
     _, flat_indices = torch.topk(difference.flatten(), args.topk, largest=True)
-    indices = [
-        [flat_indice.numpy() // 32, flat_indice.numpy() % 32]
-        for flat_indice in flat_indices
-    ]
-    results.update({"hal_heads": indices})
-    _, flat_indices = torch.topk(difference.flatten(), args.topk, largest=False)
-    indices = [
-        [flat_indice.numpy() // 32, flat_indice.numpy() % 32]
-        for flat_indice in flat_indices
-    ]
-    results.update({"non_hal_heads": indices})
-    print(results)
+    indices = [[fi.numpy() // head_num, fi.numpy() % head_num] for fi in flat_indices]
+    results["hal_heads_contrastive"] = indices
 
-    print(f"{args.output_path}/heads/attribution_result.json")
+    _, flat_indices = torch.topk(difference.flatten(), args.topk, largest=False)
+    indices = [[fi.numpy() // head_num, fi.numpy() % head_num] for fi in flat_indices]
+    results["non_hal_heads_contrastive"] = indices
+
+    _, flat_indices = torch.topk(mean_hal.flatten(), args.topk, largest=True)
+    indices = [[fi.numpy() // head_num, fi.numpy() % head_num] for fi in flat_indices]
+    results["hal_heads_mean"] = indices
+
+    _, flat_indices = torch.topk(mean_hal.flatten(), args.topk, largest=False)
+    indices = [[fi.numpy() // head_num, fi.numpy() % head_num] for fi in flat_indices]
+    results["non_hal_heads_mean"] = indices
+
+    print(results)
     with open(f"{args.output_path}/heads/attribution_result.json", "w") as file:
         json.dump(results, file, default=json_custom_serializer)
+    print(f"Saved: {args.output_path}/heads/attribution_result.json")
 
 
 if __name__ == "__main__":
@@ -300,24 +361,27 @@ if __name__ == "__main__":
     parser.add_argument(
         "--input_file",
         type=str,
-        default="/nobackup/le/AV_Hallucination/results/videollama2/AVHBench/sampled_entities.json",
+        default="/nobackup3/le/AV_Hallucination/results/videollama2/AVCaps/sampled_entities.json",
     )
     parser.add_argument(
         "--video_folder",
         type=str,
-        default="/nobackup/le/AV_Hallucination/data/AVHBench/videos",
+        default="/nobackup3/le/AV_Hallucination/data/AVCaps/videos",
     )
     parser.add_argument(
         "--model_path", type=str, default="DAMO-NLP-SG/VideoLLaMA2.1-7B-AV"
     )
-    parser.add_argument("--modal_type", type=str, default="av")
+    parser.add_argument(
+        "--modal_type", type=str, default="av", choices=["av", "v", "a"]
+    )
     parser.add_argument(
         "--output_path",
         type=str,
-        default="/nobackup/le/AV_Hallucination/results/videollama2/AVHBench/attribution",
+        default="/nobackup3/le/AV_Hallucination/results/videollama2/AVCaps/attribution",
     )
     parser.add_argument("--influence_score", type=str, default="prob_diff")
     parser.add_argument("--topk", type=int, default=30)
+    parser.add_argument("--skip", action="store_true")
     args = parser.parse_args()
     layer_num, head_num = main(args)
     contrastive_score(args, layer_num, head_num)

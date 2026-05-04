@@ -10,9 +10,8 @@ import nltk
 import tqdm
 from nltk import pos_tag, word_tokenize
 from torch.utils.data import DataLoader, Dataset
-from videollama2.utils import disable_torch_init
-
 from videollama2 import mm_infer, model_init
+from videollama2.utils import disable_torch_init
 
 nltk.download("averaged_perceptron_tagger_eng")
 
@@ -29,6 +28,7 @@ TASKS = [
     "Video-driven Audio Hallucination",
     "Audio-driven Video Hallucination",
     "AV Captioning",
+    "Audio Captioning",
 ]
 
 
@@ -45,19 +45,24 @@ class CustomDataset(Dataset):
     def __getitem__(self, index):
         line = self.questions[index]
         video_path = os.path.join(self.video_folder, line["video"])
-        if line["task"] == "AV Captioning":
-            qs = f"{line['question']}. Please describe the video in one full sentence."
+        if "Captioning" in line["task"]:
+            qs = f"{line['question']}"
         else:
             qs = f"{line['question']}. Start you answer with Yes/No and please provide a detailed explanation after that."
         modal = self.args.modal_type
 
-        preprocess = self.processor["audio" if modal == "a" else "video"]
         try:
-            audio_video_tensor = preprocess(
-                video_path, va=True if modal == "av" else False
-            )
+            if modal == "a":
+                audio_video_tensor = self.processor["audio"](video_path)
+            else:
+                audio_video_tensor = self.processor["video"](
+                    video_path, va=True if modal == "av" else False
+                )
         except Exception:
+            import traceback
+
             print(f"video read error: {video_path}")
+            traceback.print_exc()
             audio_video_tensor = None
 
         return {
@@ -115,11 +120,15 @@ def get_entity_labels_for_entry(entry: dict) -> dict:
             for entity in entities:
                 result["gt_entities"].append(entity)
 
-    elif task == "AV Captioning":
+    elif (
+        task == "AV Captioning"
+        or task == "Audio Captioning"
+        or task == "Video Captioning"
+    ):
         entities = extract_entity(label)
         if entities:
             for entity in entities:
-                result["gt_entities"].append(entity)
+                result["gt_entities"].append(entity.lower())
 
     return result
 
@@ -143,7 +152,11 @@ def main(args):
 
     for task in TASKS:
         pool = by_task[task]
-        k = min(args.n_per_category, len(pool))
+        k = (
+            len(pool)
+            if args.n_per_category is None
+            else min(args.n_per_category, len(pool))
+        )
         sampled = random.sample(pool, k)
         sampled_by_task[task] = sampled
         for entry in sampled:
@@ -159,7 +172,7 @@ def main(args):
 
             record = {
                 "question_id": entry["question_id"],
-                "video": f"{video}.mp4",
+                "video": video if os.path.splitext(video)[1] else f"{video}.mp4",
                 "task": task,
                 "question": entry["text"],
                 "answer": entry["label"],
@@ -186,23 +199,18 @@ def main(args):
         enumerate(dataloader), total=len(results)
     ):
         audio_video_tensor = aud_vid_tensors[0]
+        assert audio_video_tensor is not None
         question = questions[0]
         modal = modals[0]
 
-        try:
-            output = mm_infer(
-                audio_video_tensor,
-                question,
-                model=model,
-                tokenizer=tokenizer,
-                modal=modal,
-                do_sample=False,
-            )
-        except Exception:
-            import traceback
-
-            traceback.print_exc()
-            output = "error"
+        output = mm_infer(
+            audio_video_tensor,
+            question,
+            model=model,
+            tokenizer=tokenizer,
+            modal=modal,
+            do_sample=False,
+        )
 
         results[i]["generated_caption"] = output
 
@@ -210,13 +218,13 @@ def main(args):
         results[i]["generated_entities"] = output_entities
 
         for entity in output_entities:
-            if entity in results[i]["gt_entities"]:
+            if entity.lower() in results[i]["gt_entities"]:
                 results[i]["non_hallucinated_entities"].append(entity)
-                tokens = tokenizer.encode(entity, add_special_tokens=False)
+                tokens = tokenizer.encode(" " + entity, add_special_tokens=False)
                 results[i]["non_hallucinated_tokens"].extend(tokens)
             else:
                 results[i]["hallucinated_entities"].append(entity)
-                tokens = tokenizer.encode(entity, add_special_tokens=False)
+                tokens = tokenizer.encode(" " + entity, add_special_tokens=False)
                 results[i]["hallucinated_tokens"].extend(tokens)
 
     with open(args.output_file, "w") as f:
@@ -225,7 +233,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--n_per_category", type=int, default=100)
+    parser.add_argument("--n_per_category", type=int, default=None)
     parser.add_argument(
         "--model_path", type=str, default="DAMO-NLP-SG/VideoLLaMA2.1-7B-AV"
     )
