@@ -255,30 +255,56 @@ def _sample(
 
         if is_target:
             influences = [[None for _ in range(head_num)] for _ in range(layer_num)]
+
+            # For the first token (initial_cache_empty), after_keys holds the full
+            # prefill KV (positions 0..N-1).  Build a single-token decode context:
+            # past_kv = positions 0..N-2, input = last prompt token.
+            # This makes the first-token ablation identical in cost to all later
+            # tokens (1 token forward pass instead of a full N-token prefill).
+            # Build ablation_inputs for the first-token case: single-token decode
+            # using pkv populated with positions 0..N-2 (truncated prefill).
+            # This is the same structure as the before_keys path — pkv is modified
+            # in place before each ablation pass, and ablation_inputs slices the
+            # full-prompt model_inputs down to just the last token.
+            if initial_cache_empty and is_dynamic_cache and after_keys is not None:
+                ablation_inputs = dict(model_inputs)
+                ablation_inputs.pop("images", None)
+                if "inputs_embeds" in model_inputs and model_inputs["inputs_embeds"] is not None:
+                    ablation_inputs["inputs_embeds"] = model_inputs["inputs_embeds"][:, -1:, :]
+                    ablation_inputs.pop("input_ids", None)
+                elif "input_ids" in model_inputs and model_inputs["input_ids"] is not None:
+                    ablation_inputs["input_ids"] = model_inputs["input_ids"][:, -1:]
+                if "position_ids" in ablation_inputs and ablation_inputs["position_ids"] is not None:
+                    ablation_inputs["position_ids"] = ablation_inputs["position_ids"][:, -1:]
+                if "cache_position" in ablation_inputs and ablation_inputs["cache_position"] is not None:
+                    ablation_inputs["cache_position"] = ablation_inputs["cache_position"][-1:]
+            else:
+                ablation_inputs = model_inputs
+
             for layer_idx in range(layer_num):
                 o_proj_module = o_proj_modules[layer_idx]
                 for head_idx in range(head_num):
-                    # Restore "before" cache so every ablation pass sees the same
-                    # sequence length as the original main forward pass.
-                    if before_keys is not None:
+                    # Restore pkv to the pre-forward state before each ablation pass.
+                    if initial_cache_empty and is_dynamic_cache and after_keys is not None:
+                        # Populate pkv with positions 0..N-2 from the prefill cache.
+                        for i in range(len(after_keys)):
+                            if i < len(pkv.key_cache):
+                                pkv.key_cache[i] = after_keys[i][:, :, :-1, :].clone()
+                                pkv.value_cache[i] = after_values[i][:, :, :-1, :].clone()
+                            else:
+                                pkv.key_cache.append(after_keys[i][:, :, :-1, :].clone())
+                                pkv.value_cache.append(after_values[i][:, :, :-1, :].clone())
+                        pkv._seen_tokens = after_keys[0].shape[2] - 1
+                    elif before_keys is not None:
                         for i in range(len(before_keys)):
                             pkv.key_cache[i] = before_keys[i]
                             pkv.value_cache[i] = before_values[i]
-                    elif initial_cache_empty and is_dynamic_cache:
-                        # First generation step: prompt was in input_ids, cache was
-                        # empty.  After the main forward, pkv is now populated.
-                        # Each ablation forward must start from an empty cache so
-                        # it processes the full prompt from scratch (not prompt +
-                        # accumulated ablation cache, which would double kv_seq_len).
-                        pkv.key_cache = []
-                        pkv.value_cache = []
-                        pkv._seen_tokens = 0
 
                     hook_handle = o_proj_module.register_forward_pre_hook(
                         attach_custom_hook(layer_idx, head_idx)
                     )
                     outputs_ablated = self(
-                        **model_inputs,
+                        **ablation_inputs,
                         return_dict=True,
                         output_attentions=False,
                         output_hidden_states=False,
@@ -585,30 +611,56 @@ def zero_ablation_sample(
 
         if is_target:
             influences = [[None for _ in range(head_num)] for _ in range(layer_num)]
+
+            # For the first token (initial_cache_empty), after_keys holds the full
+            # prefill KV (positions 0..N-1).  Build a single-token decode context:
+            # past_kv = positions 0..N-2, input = last prompt token.
+            # This makes the first-token ablation identical in cost to all later
+            # tokens (1 token forward pass instead of a full N-token prefill).
+            # Build ablation_inputs for the first-token case: single-token decode
+            # using pkv populated with positions 0..N-2 (truncated prefill).
+            # This is the same structure as the before_keys path — pkv is modified
+            # in place before each ablation pass, and ablation_inputs slices the
+            # full-prompt model_inputs down to just the last token.
+            if initial_cache_empty and is_dynamic_cache and after_keys is not None:
+                ablation_inputs = dict(model_inputs)
+                ablation_inputs.pop("images", None)
+                if "inputs_embeds" in model_inputs and model_inputs["inputs_embeds"] is not None:
+                    ablation_inputs["inputs_embeds"] = model_inputs["inputs_embeds"][:, -1:, :]
+                    ablation_inputs.pop("input_ids", None)
+                elif "input_ids" in model_inputs and model_inputs["input_ids"] is not None:
+                    ablation_inputs["input_ids"] = model_inputs["input_ids"][:, -1:]
+                if "position_ids" in ablation_inputs and ablation_inputs["position_ids"] is not None:
+                    ablation_inputs["position_ids"] = ablation_inputs["position_ids"][:, -1:]
+                if "cache_position" in ablation_inputs and ablation_inputs["cache_position"] is not None:
+                    ablation_inputs["cache_position"] = ablation_inputs["cache_position"][-1:]
+            else:
+                ablation_inputs = model_inputs
+
             for layer_idx in range(layer_num):
                 o_proj_module = o_proj_modules[layer_idx]
                 for head_idx in range(head_num):
-                    # Restore "before" cache so every ablation pass sees the same
-                    # sequence length as the original main forward pass.
-                    if before_keys is not None:
+                    # Restore pkv to the pre-forward state before each ablation pass.
+                    if initial_cache_empty and is_dynamic_cache and after_keys is not None:
+                        # Populate pkv with positions 0..N-2 from the prefill cache.
+                        for i in range(len(after_keys)):
+                            if i < len(pkv.key_cache):
+                                pkv.key_cache[i] = after_keys[i][:, :, :-1, :].clone()
+                                pkv.value_cache[i] = after_values[i][:, :, :-1, :].clone()
+                            else:
+                                pkv.key_cache.append(after_keys[i][:, :, :-1, :].clone())
+                                pkv.value_cache.append(after_values[i][:, :, :-1, :].clone())
+                        pkv._seen_tokens = after_keys[0].shape[2] - 1
+                    elif before_keys is not None:
                         for i in range(len(before_keys)):
                             pkv.key_cache[i] = before_keys[i]
                             pkv.value_cache[i] = before_values[i]
-                    elif initial_cache_empty and is_dynamic_cache:
-                        # First generation step: prompt was in input_ids, cache was
-                        # empty.  After the main forward, pkv is now populated.
-                        # Each ablation forward must start from an empty cache so
-                        # it processes the full prompt from scratch (not prompt +
-                        # accumulated ablation cache, which would double kv_seq_len).
-                        pkv.key_cache = []
-                        pkv.value_cache = []
-                        pkv._seen_tokens = 0
 
                     hook_handle = o_proj_module.register_forward_pre_hook(
                         attach_custom_hook(layer_idx, head_idx)
                     )
                     outputs_ablated = self(
-                        **model_inputs,
+                        **ablation_inputs,
                         return_dict=True,
                         output_attentions=False,
                         output_hidden_states=False,

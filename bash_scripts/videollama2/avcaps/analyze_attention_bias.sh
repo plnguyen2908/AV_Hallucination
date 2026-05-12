@@ -9,7 +9,7 @@ VIDEO_FOLDER="$ROOT_DIR/data/AVCaps/videos"
 INPUT_FILE="$ROOT_DIR/results/videollama2/AVCaps/sampled_entities.json"
 ATTENTION_HEAD_PATH="$ROOT_DIR/results/videollama2/AVCaps/attribution/heads/attribution_result.json"
 OUTPUT_PATH="$ROOT_DIR/results/videollama2/AVCaps/attention_bias"
-TOP_K=20
+TOP_K=10
 
 CUDA_VISIBLE_DEVICES=0,1,2,3 python "$ROOT_DIR/method/videollama2/analyze_attention_bias.py" \
     --model_path "$MODEL_PATH" \

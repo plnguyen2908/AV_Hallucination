@@ -4,10 +4,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 MODEL_PATH="DAMO-NLP-SG/VideoLLaMA2.1-7B-AV"
-MODAL_TYPE="a"
-VIDEO_FOLDER="$ROOT_DIR/data/AudioSet/audios"
-OUTPUT_FILE="$ROOT_DIR/results/videollama2/AudioSet/sampled_entities.json"
-QA_FILE="$ROOT_DIR/data/AudioSet/QA.json"
+MODAL_TYPE="v"
+VIDEO_FOLDER="$ROOT_DIR/data/MSVD/videos"
+OUTPUT_FILE="$ROOT_DIR/results/videollama2/MSVD/sampled_entities.json"
+QA_FILE="$ROOT_DIR/data/MSVD/QA.json"
 
 CUDA_VISIBLE_DEVICES=0,1,2,3 python "$ROOT_DIR/method/videollama2/eval.py" \
     --model_path "$MODEL_PATH" \
@@ -15,5 +15,4 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python "$ROOT_DIR/method/videollama2/eval.py" \
     --video_folder "$VIDEO_FOLDER" \
     --output_file "$OUTPUT_FILE" \
     --QA_FILE "$QA_FILE" \
-    --n_per_category 500 \
-    --tasks "Video-driven Audio Hallucination"
+    --n_per_category 300

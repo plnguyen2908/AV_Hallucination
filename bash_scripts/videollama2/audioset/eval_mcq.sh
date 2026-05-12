@@ -5,9 +5,10 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 MODEL_PATH="DAMO-NLP-SG/VideoLLaMA2.1-7B-AV"
 MODAL_TYPE="a"
+# WAVs live in the original AudioSet location; only QA.json differs per variant.
 VIDEO_FOLDER="$ROOT_DIR/data/AudioSet/audios"
-OUTPUT_FILE="$ROOT_DIR/results/videollama2/AudioSet/sampled_entities.json"
-QA_FILE="$ROOT_DIR/data/AudioSet/QA.json"
+OUTPUT_FILE="$ROOT_DIR/results/videollama2/AudioSet_mcq/sampled_entities.json"
+QA_FILE="$ROOT_DIR/data/AudioSet_mcq/QA.json"
 
 CUDA_VISIBLE_DEVICES=0,1,2,3 python "$ROOT_DIR/method/videollama2/eval.py" \
     --model_path "$MODEL_PATH" \
@@ -16,4 +17,4 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python "$ROOT_DIR/method/videollama2/eval.py" \
     --output_file "$OUTPUT_FILE" \
     --QA_FILE "$QA_FILE" \
     --n_per_category 500 \
-    --tasks "Video-driven Audio Hallucination"
+    --tasks "AudioSet Multiple-Choice"

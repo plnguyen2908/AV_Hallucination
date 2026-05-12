@@ -3,6 +3,7 @@ import json
 import os
 import shutil
 
+import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
@@ -16,6 +17,54 @@ from videollama2.constants import (
 )
 from videollama2.mm_utils import KeywordsStoppingCriteria, tokenizer_multimodal_token
 from videollama2.utils import disable_torch_init
+
+
+def _heatmap(data, ax, title=None, hal_heads=None, non_hal_heads=None):
+    # 1. Automatic Contrast
+    # Using a symmetric limit based on the actual data spread
+    v_limit = np.percentile(np.abs(data), 99.0)
+
+    # 2. Standard Heatmap Call
+    # We remove the custom colorbar logic to keep it "normal"
+    sns.heatmap(
+        data,
+        cmap="coolwarm",
+        center=0,
+        ax=ax,
+        vmin=-v_limit,
+        vmax=v_limit,
+        cbar_kws={"shrink": 0.8},  # Keeps colorbar from being taller than the plot
+    )
+
+    # 3. Drawing Outlines
+    # Zip allows us to loop through both sets of heads and colors cleanly
+    for heads, color in zip([hal_heads, non_hal_heads], ["red", "blue"]):
+        if heads:
+            for layer_idx, head_idx in heads:
+                # IMPORTANT: Matplotlib patches use (x, y) coordinates.
+                # If Layer is Y (rows) and Head is X (cols): use (head_idx, layer_idx)
+                # If Layer is X (cols) and Head is Y (rows): use (layer_idx, head_idx)
+
+                # Based on your previous screenshots (Layer=Y, Head=X):
+                ax.add_patch(
+                    mpatches.Rectangle(
+                        (head_idx, layer_idx),
+                        1,
+                        1,
+                        fill=False,
+                        edgecolor=color,
+                        linewidth=2,
+                        zorder=3,
+                    )
+                )
+
+    # 4. Formatting
+    if title:
+        ax.set_title(title, pad=20)
+
+    # Adjust these to match your specific data orientation
+    ax.set_ylabel("Layer Index")
+    ax.set_xlabel("Head Index")
 
 
 def json_custom_serializer(obj):
@@ -71,7 +120,7 @@ def main(args):
         if "Captioning" in task:
             qs = prompt
         else:
-            qs = f"{prompt}. Start you answer with Yes/No and please provide a detailed explanation after that."
+            qs = f"{prompt}"
 
         modal = args.modal_type  # "av", "v", or "a"
 
@@ -108,19 +157,13 @@ def main(args):
             non_hallucinated_entities,
             args.influence_score,
         )
-        if not hallucinated_entities:
-            print(f"Skipping {question_id} - no hallucinated entities")
-            continue
 
         if isinstance(audio_video_tensor, dict):
             tensor = {
-                k: v.to(torch.float16 if k == "audio" else torch.bfloat16).cuda()
-                for k, v in audio_video_tensor.items()
+                k: v.to(torch.float16).cuda() for k, v in audio_video_tensor.items()
             }
-        elif modal == "a":
-            tensor = audio_video_tensor.to(torch.float16).cuda()
         else:
-            tensor = audio_video_tensor.to(torch.bfloat16).cuda()
+            tensor = audio_video_tensor.to(torch.float16).cuda()
         tensor = [(tensor, modal_str)]
 
         message = [{"role": "user", "content": modal_token + "\n" + qs}]
@@ -160,6 +203,8 @@ def main(args):
         keywords = [tokenizer.eos_token]
         stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
 
+        max_new_tokens = 5 if "Captioning" not in task else 2048
+
         with torch.inference_mode():
             outputs = model.generate(
                 input_ids,
@@ -167,7 +212,7 @@ def main(args):
                 images=tensor,
                 do_sample=False,
                 temperature=0.0,
-                max_new_tokens=2048,
+                max_new_tokens=max_new_tokens,
                 top_p=0.9,
                 use_cache=True,
                 stopping_criteria=[stopping_criteria],
@@ -223,12 +268,7 @@ def main(args):
                         ]
                 influences.append(torch.nan_to_num(influence, nan=0.0))
             fig, ax = plt.subplots(figsize=(8, 8))
-            sns.heatmap(
-                torch.mean(torch.stack(influences), 0).cpu().numpy(),
-                cmap="coolwarm",
-                center=0,
-                ax=ax,
-            )
+            _heatmap(torch.mean(torch.stack(influences), 0).cpu().numpy(), ax)
             ax.set_xlabel("Head")
             ax.set_ylabel("Layer")
             fig.savefig(
@@ -247,12 +287,7 @@ def main(args):
                         ]
                 influences.append(torch.nan_to_num(influence, nan=0.0))
             fig, ax = plt.subplots(figsize=(8, 8))
-            sns.heatmap(
-                torch.mean(torch.stack(influences), 0).cpu().numpy(),
-                cmap="coolwarm",
-                center=0,
-                ax=ax,
-            )
+            _heatmap(torch.mean(torch.stack(influences), 0).cpu().numpy(), ax)
             ax.set_xlabel("Head")
             ax.set_ylabel("Layer")
             fig.savefig(
@@ -310,37 +345,45 @@ def contrastive_score(args, layer_num, head_num):
     difference = mean_hal - mean_non_hal
 
     fig, ax = plt.subplots(figsize=(8, 8))
-    sns.heatmap(mean_hal.cpu().numpy(), cmap="coolwarm", center=0, ax=ax)
+    _heatmap(mean_hal.cpu().numpy(), ax, "Mean Hallucination Influence")
     ax.set_xlabel("Head Index", fontsize=12)
     ax.set_ylabel("Layer Index", fontsize=12)
-    ax.set_title("Mean Hallucination Influence")
     fig.savefig(f"{args.output_path}/images/mean_hallucination_influences.png")
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(8, 8))
-    sns.heatmap(mean_non_hal.cpu().numpy(), cmap="coolwarm", center=0, ax=ax)
+    _heatmap(mean_non_hal.cpu().numpy(), ax, "Mean Non-Hallucination Influence")
     ax.set_xlabel("Head Index", fontsize=12)
     ax.set_ylabel("Layer Index", fontsize=12)
-    ax.set_title("Mean Non-Hallucination Influence")
     fig.savefig(f"{args.output_path}/images/mean_non_hallucination_influences.png")
     plt.close(fig)
 
+    _, flat_indices = torch.topk(difference.flatten(), args.topk, largest=True)
+    hal_heads_contrastive = [
+        [int(fi.numpy() // head_num), int(fi.numpy() % head_num)] for fi in flat_indices
+    ]
+
+    _, flat_indices = torch.topk(difference.flatten(), args.topk, largest=False)
+    non_hal_heads_contrastive = [
+        [int(fi.numpy() // head_num), int(fi.numpy() % head_num)] for fi in flat_indices
+    ]
+
     fig, ax = plt.subplots(figsize=(8, 8))
-    sns.heatmap(difference.cpu().numpy(), cmap="coolwarm", center=0, ax=ax)
+    _heatmap(
+        difference.cpu().numpy(),
+        ax,
+        "Contrastive Influence (Hal - Non-Hal)",
+        hal_heads=hal_heads_contrastive,
+        non_hal_heads=non_hal_heads_contrastive,
+    )
     ax.set_xlabel("Head Index", fontsize=12)
     ax.set_ylabel("Layer Index", fontsize=12)
-    ax.set_title("Contrastive Influence (Hal - Non-Hal)")
     fig.savefig(f"{args.output_path}/images/contrastive_influences.png")
     plt.close(fig)
 
     results = {}
-    _, flat_indices = torch.topk(difference.flatten(), args.topk, largest=True)
-    indices = [[fi.numpy() // head_num, fi.numpy() % head_num] for fi in flat_indices]
-    results["hal_heads_contrastive"] = indices
-
-    _, flat_indices = torch.topk(difference.flatten(), args.topk, largest=False)
-    indices = [[fi.numpy() // head_num, fi.numpy() % head_num] for fi in flat_indices]
-    results["non_hal_heads_contrastive"] = indices
+    results["hal_heads_contrastive"] = hal_heads_contrastive
+    results["non_hal_heads_contrastive"] = non_hal_heads_contrastive
 
     _, flat_indices = torch.topk(mean_hal.flatten(), args.topk, largest=True)
     indices = [[fi.numpy() // head_num, fi.numpy() % head_num] for fi in flat_indices]

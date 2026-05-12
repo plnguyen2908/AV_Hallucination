@@ -15,4 +15,4 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python "$ROOT_DIR/method/videollama2/eval.py" \
     --video_folder "$VIDEO_FOLDER" \
     --output_file "$OUTPUT_FILE" \
     --QA_FILE "$QA_FILE" \
-    --n_per_category 500
+    --n_per_category 300

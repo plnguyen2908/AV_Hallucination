@@ -55,9 +55,7 @@ def compute_attn_stats(
             row = step0_attns[layer_idx][0, head_idx, entity_emb_pos, :].float()
             vid += row[video_start:video_end].sum().item()
             aud += row[audio_start:audio_end].sum().item()
-            txt += (
-                row[:video_start].sum() + row[audio_end:entity_emb_pos].sum()
-            ).item()
+            txt += row[audio_end:entity_emb_pos].sum().item()
         n = len(heads)
         return vid / n, aud / n, txt / n
 
@@ -91,7 +89,7 @@ def eval_model(args):
         preprocess = processor["audio"]
         modal_token = DEFAULT_AUDIO_TOKEN
         modal_token_idx = AUDIO_TOKEN_INDEX
-        task_filter = {"Audio Captioning", "Audio-driven Video Hallucination"}
+        task_filter = {"Audio Captioning", "Video-driven Audio Hallucination"}
     elif modal_type == "v":
         preprocess = processor["video"]
         modal_token = DEFAULT_VIDEO_TOKEN
@@ -110,7 +108,7 @@ def eval_model(args):
         s
         for s in samples
         if s.get("task") in task_filter
-        and s.get("hallucinated_entities")
+        and (s.get("hallucinated_entities") or s.get("non_hallucinated_entities"))
         and s.get("generated_caption")
     ]
     print(f"[{modal_type}] Samples to process: {len(samples)}")
@@ -345,11 +343,15 @@ def plot_result(args):
 
     # Modality bars depend on what was recorded
     if modal_type == "v":
-        modalities = [("Video", "hal_video", "nhal_video")]
-        modalities += [("Text", "hal_text", "nhal_text")]
+        modalities = [
+            ("Video", "hal_video", "nhal_video"),
+            ("Text", "hal_text", "nhal_text"),
+        ]
     elif modal_type == "a":
-        modalities = [("Audio", "hal_audio", "nhal_audio")]
-        modalities += [("Text", "hal_text", "nhal_text")]
+        modalities = [
+            ("Audio", "hal_audio", "nhal_audio"),
+            ("Text", "hal_text", "nhal_text"),
+        ]
     else:  # "av"
         modalities = [
             ("Video", "hal_video", "nhal_video"),
@@ -361,7 +363,6 @@ def plot_result(args):
     bar_width = 0.2
     group_spacing = 1.0
     mod_colors = ["tab:blue", "tab:orange", "tab:green"][:n]
-    mod_labels = [m[0] for m in modalities]
 
     hal_center = 0.0
     nhal_center = group_spacing
@@ -369,25 +370,60 @@ def plot_result(args):
     hal_xs = hal_center + offsets
     nhal_xs = nhal_center + offsets
 
-    fig, axes = plt.subplots(1, 2, figsize=(5 * max(n, 2), 6))
-
-    for ax, title, stats in [
-        (axes[0], "At Hallucinated Entity Tokens", hal_stats),
-        (axes[1], "At Non-Hallucinated Entity Tokens", nonhal_stats),
-    ]:
+    def _draw_single(ax, title, stats):
         for i, (mod_label, hal_key, nhal_key) in enumerate(modalities):
-            ax.bar(hal_xs[i], col_mean(stats, hal_key), bar_width, color=mod_colors[i], label=mod_label)
-            ax.bar(nhal_xs[i], col_mean(stats, nhal_key), bar_width, color=mod_colors[i])
-
-        ax.set_title(f"[{modal_type.upper()}] {title}", fontsize=13)
+            print(f"[{title}] {mod_label}, hal_heads: {col_mean(stats, hal_key):.4f}")
+            ax.bar(
+                hal_xs[i],
+                col_mean(stats, hal_key),
+                bar_width,
+                color=mod_colors[i],
+                label=mod_label,
+            )
+            print(f"[{title}] {mod_label}, nhal_heads: {col_mean(stats, nhal_key):.4f}")
+            ax.bar(
+                nhal_xs[i], col_mean(stats, nhal_key), bar_width, color=mod_colors[i]
+            )
+        ax.set_title(
+            f"[{modal_type.upper()}] {title} (top {args.top_k} heads)", fontsize=13
+        )
         ax.set_ylabel("Mean Attention Weight", fontsize=12)
         ax.set_xticks([hal_center, nhal_center])
         ax.set_xticklabels(["Hal Heads", "Non-Hal Heads"], fontsize=12)
+        ax.set_ylim(0, 1)
         ax.grid(axis="y", linestyle="--", alpha=0.7)
         ax.legend(title="Modality", fontsize=11)
 
+    # Graph 1: hallucinated entity tokens only
+    fig, ax = plt.subplots(figsize=(5 * max(n, 2), 6))
+    _draw_single(ax, "At Hallucinated Entity Tokens", hal_stats)
     plt.tight_layout()
-    out_path = os.path.join(args.output_path, "attention_bias.png")
+    out_path = os.path.join(
+        args.output_path, f"attention_bias_hal_top_{args.top_k}_heads.png"
+    )
+    plt.savefig(out_path)
+    print(f"Saved plot: {out_path}")
+    plt.close(fig)
+
+    # Graph 2: non-hallucinated entity tokens only
+    fig, ax = plt.subplots(figsize=(5 * max(n, 2), 6))
+    _draw_single(ax, "At Non-Hallucinated Entity Tokens", nonhal_stats)
+    plt.tight_layout()
+    out_path = os.path.join(
+        args.output_path, f"attention_bias_nonhal_top_{args.top_k}_heads.png"
+    )
+    plt.savefig(out_path)
+    print(f"Saved plot: {out_path}")
+    plt.close(fig)
+
+    # Graph 3: both side by side (original layout)
+    fig, axes = plt.subplots(1, 2, figsize=(5 * max(n, 2) * 2, 6))
+    _draw_single(axes[0], "At Hallucinated Entity Tokens", hal_stats)
+    _draw_single(axes[1], "At Non-Hallucinated Entity Tokens", nonhal_stats)
+    plt.tight_layout()
+    out_path = os.path.join(
+        args.output_path, f"attention_bias_top_{args.top_k}_heads.png"
+    )
     plt.savefig(out_path)
     print(f"Saved plot: {out_path}")
     plt.close(fig)

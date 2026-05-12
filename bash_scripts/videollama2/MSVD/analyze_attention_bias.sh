@@ -4,12 +4,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 MODEL_PATH="DAMO-NLP-SG/VideoLLaMA2.1-7B-AV"
-MODAL_TYPE="a"
-VIDEO_FOLDER="$ROOT_DIR/data/AudioSet/audios"
-INPUT_FILE="$ROOT_DIR/results/videollama2/AudioSet/sampled_entities.json"
-ATTENTION_HEAD_PATH="$ROOT_DIR/results/videollama2/AudioSet/attribution/heads/attribution_result.json"
-OUTPUT_PATH="$ROOT_DIR/results/videollama2/AudioSet/attention_bias"
-TOP_K=20
+MODAL_TYPE="v"
+VIDEO_FOLDER="$ROOT_DIR/data/MSVD/videos"
+INPUT_FILE="$ROOT_DIR/results/videollama2/MSVD/sampled_entities.json"
+ATTENTION_HEAD_PATH="$ROOT_DIR/results/videollama2/MSVD/attribution/heads/attribution_result.json"
+OUTPUT_PATH="$ROOT_DIR/results/videollama2/MSVD/attention_bias"
+TOP_K=10
 
 CUDA_VISIBLE_DEVICES=0,1,2,3 python "$ROOT_DIR/method/videollama2/analyze_attention_bias.py" \
     --model_path "$MODEL_PATH" \
