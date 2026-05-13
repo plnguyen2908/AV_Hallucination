@@ -89,7 +89,12 @@ def eval_model(args):
         preprocess = processor["audio"]
         modal_token = DEFAULT_AUDIO_TOKEN
         modal_token_idx = AUDIO_TOKEN_INDEX
-        task_filter = {"Audio Captioning", "Video-driven Audio Hallucination"}
+        task_filter = {
+            "Audio Captioning",
+            "Video-driven Audio Hallucination",
+            "AudioSet Captioning",        # describe variant
+            "AudioSet Multiple-Choice",   # mcq variant
+        }
     elif modal_type == "v":
         preprocess = processor["video"]
         modal_token = DEFAULT_VIDEO_TOKEN
@@ -250,8 +255,14 @@ def eval_model(args):
         assert n_modal > 0
 
         # outputs['attentions'][0]: tuple of num_layers tensors (prefill step)
-        # Each tensor: (batch, heads, q_len, kv_len)
-        step0_attns = outputs["attentions"][0]
+        # Each tensor: (batch, heads, q_len, kv_len). For long-prompt variants
+        # like AudioSet describe (~2k extra tokens for the inline label list),
+        # the full stack is ~10 GB on the forward GPU. Move to CPU and free the
+        # rest of `outputs` (KV cache, logits) immediately. The per-row stats
+        # below are scalar reductions, so CPU is fast enough.
+        step0_attns = tuple(a.detach().to("cpu") for a in outputs["attentions"][0])
+        del outputs
+        torch.cuda.empty_cache()
         assert isinstance(step0_attns, tuple) and len(step0_attns) > 0, (
             f"Expected tuple of layer attentions, got {type(step0_attns)}"
         )

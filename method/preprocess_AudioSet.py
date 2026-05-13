@@ -12,22 +12,27 @@ in one of three formats selected via --variant:
       text: "Does the <label> sound appear in the audio?"
 
   describe
-      One open-ended QA entry per audio. The prompt embeds the full
-      AudioSet label vocabulary so the model is constrained to a
-      closed vocabulary.
+      One open-ended QA entry per audio. The prompt embeds a small
+      per-entry option list — the clip's GT labels plus
+      --n_distractors_describe random distractor labels (shuffled
+      together) — so the model is constrained to a closed but short
+      vocabulary. Previous versions inlined the full ~516-label list,
+      which blew up GPU memory during attention-bias analysis.
       text:  "Listen to the audio and describe what you hear. Choose
               only from the following AudioSet sound labels: <list>."
       label: list[str] — the ground-truth AudioSet labels for the clip.
       Also writes the full label vocabulary to
-      <--out>/audioset_labels.txt (one label per line).
+      <--out>/audioset_labels.txt (one label per line) for
+      eval.py's output scanning.
 
   mcq
-      One 4-option multiple-choice QA entry per audio. One option
-      (placed at a random letter) contains ALL of the clip's GT labels;
-      the other three options each contain the same number of
-      distractor labels (disjoint within the question, sampled from
-      labels the clip does NOT have). The A/B/C/D options are inlined
-      into `text`; `label` is the correct letter.
+      One 4-option multiple-choice QA entry per GT label (so a clip
+      with k GT labels yields k MCQ entries). The correct option is
+      that single GT label, placed at a random letter; the other three
+      options are random distractor labels sampled from labels the
+      clip does NOT have (so no option is silently also correct).
+      The A/B/C/D options are inlined into `text`; `label` is the
+      correct letter.
 
 All variants share the same schema so `eval.py` can read any of them
 unchanged:
@@ -176,14 +181,23 @@ def build_entry_describe(
     split: str,
     audio_labels: list[str],
     global_labels_list: list[str],
+    n_distractors: int,
 ) -> dict:
+    # Per-entry option list: GT labels + a small sample of distractors,
+    # shuffled so position carries no signal. Inlining the full ~516-label
+    # vocabulary made the prefill OOM on the attention-bias pass.
+    distractor_pool = [l for l in global_labels_list if l not in audio_labels]
+    n_take = min(n_distractors, len(distractor_pool))
+    distractors = random.sample(distractor_pool, n_take)
+    options = list(audio_labels) + distractors
+    random.shuffle(options)
     return {
         "video_id": wav_name,
         "task": TASK_DESCRIBE,
         "text": (
             "Listen to the audio and describe what you hear. "
             "Choose only from the following AudioSet sound labels: "
-            + ", ".join(global_labels_list) + "."
+            + ", ".join(options) + "."
         ),
         "label": audio_labels,
         "question_id": str(uuid.uuid4()),
@@ -191,52 +205,48 @@ def build_entry_describe(
     }
 
 
-def build_entry_mcq(
+def build_entries_mcq(
     wav_name: str,
     split: str,
     audio_labels: list[str],
     global_labels_list: list[str],
-) -> dict:
-    k = len(audio_labels)
+) -> list[dict]:
+    """One MCQ entry per GT label: the correct option is that single label;
+    the other three options are random distractors drawn from labels the clip
+    does NOT have (so no option is silently also correct)."""
+    entries: list[dict] = []
     distractor_pool = [l for l in global_labels_list if l not in audio_labels]
-    needed = 3 * k
-    if len(distractor_pool) < needed:
-        # Very unlikely with 516 labels & typical k. Shrink groups uniformly.
-        per_group = len(distractor_pool) // 3
+    if len(distractor_pool) < 3:
         print(
-            f"  Warning: distractor pool ({len(distractor_pool)}) < 3*k={needed} "
-            f"for {wav_name}; shrinking each distractor option to {per_group} labels."
+            f"  Warning: distractor pool ({len(distractor_pool)}) < 3 for "
+            f"{wav_name}; skipping MCQ entries for this clip."
         )
-        sampled = random.sample(distractor_pool, per_group * 3)
-        groups = [sampled[i * per_group : (i + 1) * per_group] for i in range(3)]
-    else:
-        sampled = random.sample(distractor_pool, needed)
-        groups = [sampled[i * k : (i + 1) * k] for i in range(3)]
+        return entries
 
-    correct = random.choice(["A", "B", "C", "D"])
-    opts: dict[str, str] = {}
-    g_iter = iter(groups)
-    for L in ["A", "B", "C", "D"]:
-        if L == correct:
-            opts[L] = ", ".join(audio_labels)
-        else:
-            opts[L] = ", ".join(next(g_iter))
+    for gt_lbl in audio_labels:
+        distractors = random.sample(distractor_pool, 3)
+        correct = random.choice(["A", "B", "C", "D"])
+        opts: dict[str, str] = {}
+        d_iter = iter(distractors)
+        for L in ["A", "B", "C", "D"]:
+            opts[L] = gt_lbl if L == correct else next(d_iter)
 
-    return {
-        "video_id": wav_name,
-        "task": TASK_MCQ,
-        "text": (
-            "Which group of sounds best matches what you hear in the audio?\n"
-            f"A. {opts['A']}\n"
-            f"B. {opts['B']}\n"
-            f"C. {opts['C']}\n"
-            f"D. {opts['D']}\n"
-            "Answer with a single letter (A, B, C, or D)."
-        ),
-        "label": correct,
-        "question_id": str(uuid.uuid4()),
-        "split": split,
-    }
+        entries.append({
+            "video_id": wav_name,
+            "task": TASK_MCQ,
+            "text": (
+                "Which sound do you hear in the audio?\n"
+                f"A. {opts['A']}\n"
+                f"B. {opts['B']}\n"
+                f"C. {opts['C']}\n"
+                f"D. {opts['D']}\n"
+                "Answer with a single letter (A, B, C, or D)."
+            ),
+            "label": correct,
+            "question_id": str(uuid.uuid4()),
+            "split": split,
+        })
+    return entries
 
 
 def main(args: argparse.Namespace) -> None:
@@ -372,11 +382,14 @@ def main(args: argparse.Namespace) -> None:
             )
         elif args.variant == "describe":
             qa_entries.append(
-                build_entry_describe(wav_name, split, audio_labels, global_labels_list)
+                build_entry_describe(
+                    wav_name, split, audio_labels, global_labels_list,
+                    args.n_distractors_describe,
+                )
             )
         elif args.variant == "mcq":
-            qa_entries.append(
-                build_entry_mcq(wav_name, split, audio_labels, global_labels_list)
+            qa_entries.extend(
+                build_entries_mcq(wav_name, split, audio_labels, global_labels_list)
             )
         else:
             raise ValueError(f"Unknown variant: {args.variant}")
@@ -434,6 +447,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--n_negatives", type=int, default=4,
         help="Number of negative (label=No) QA entries per audio (hallucination variant only)",
+    )
+    parser.add_argument(
+        "--n_distractors_describe", type=int, default=10,
+        help=(
+            "Number of distractor labels added (alongside the GT labels) to "
+            "each describe entry's prompt. Keeps prompt length short to avoid "
+            "OOM at attention-analysis time. (describe variant only)"
+        ),
     )
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()

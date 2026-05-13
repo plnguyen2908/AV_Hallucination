@@ -212,7 +212,11 @@ def main(args):
             if args.n_per_category is None
             else min(args.n_per_category, len(pool))
         )
-        if task not in HALLUC_TASKS:
+        # Discrete-answer tasks (Yes/No or A/B/C/D) balance correct vs.
+        # incorrect responses at inference time. We must therefore expose the
+        # full pool to the loop — sub-sampling here would cap how many of each
+        # side we can ever observe.
+        if task not in DISCRETE_TASKS:
             sampled = random.sample(pool, k)
         else:
             random.shuffle(pool)
