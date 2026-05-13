@@ -18,10 +18,7 @@ nltk.download("averaged_perceptron_tagger_eng")
 
 
 _HERE = Path(__file__).parent
-# QA_FILE     = "/nobackup/le/AV_Hallucination/data/AVHBench/QA.json"
-OUTPUT_FILE = (
-    "/nobackup/le/AV_Hallucination/results/videollama2/AVHBench/sampled_entities.json"
-)
+_REPO = _HERE.parent.parent  # method/videollama2/ -> method/ -> repo root
 
 SEED = 42
 
@@ -387,17 +384,17 @@ if __name__ == "__main__":
     parser.add_argument(
         "--video_folder",
         type=str,
-        default="/nobackup/le/AV_Hallucination/data/AVHBench/videos",
+        default=str(_REPO / "data/AVHBench/videos"),
     )
     parser.add_argument(
         "--output_file",
         type=str,
-        default="/nobackup/le/AV_Hallucination/results/videollama2/AVHBench/sampled_entities.json",
+        default=str(_REPO / "results/videollama2/AVHBench/sampled_entities.json"),
     )
     parser.add_argument(
         "--QA_FILE",
         type=str,
-        default="/nobackup3/le/AV_Hallucination/data/AVHBench/QA.json",
+        default=str(_REPO / "data/AVHBench/QA.json"),
     )
     parser.add_argument(
         "--audioset_labels_file",

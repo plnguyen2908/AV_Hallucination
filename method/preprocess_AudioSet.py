@@ -65,6 +65,9 @@ import json
 import os
 import random
 import uuid
+from pathlib import Path
+
+_REPO = Path(__file__).resolve().parent.parent  # method/ -> repo root
 
 import pandas as pd
 import pyarrow.parquet as pq
@@ -410,7 +413,7 @@ def main(args: argparse.Namespace) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out", default="/nobackup3/le/AV_Hallucination/data/AudioSet")
+    parser.add_argument("--out", default=str(_REPO / "data/AudioSet"))
     parser.add_argument(
         "--splits", default="bal_train,eval", help="Comma-separated: bal_train, eval"
     )
