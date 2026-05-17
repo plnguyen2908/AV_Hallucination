@@ -17,5 +17,5 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python "$ROOT_DIR/method/videollama2/identify_hallu
     --input_file "$INPUT_FILE" \
     --output_path "$OUTPUT_PATH" \
     --influence_score "$INFLUENCE_SCORE" \
-    --topk 100
-# --skip
+    --topk 40 \
+    --skip

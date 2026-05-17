@@ -1,0 +1,60 @@
+# Qwen2.5-Omni pipeline environment.
+#
+# Install into a FRESH venv that is independent of videollama2_venv — the two
+# environments diverge on `transformers` (Qwen2.5-Omni needs >=4.52.3; the
+# vendored VideoLLaMA2 pins 4.42.3) and on `huggingface_hub` (>=0.25 vs.
+# ==0.23.4).
+#
+# Usage:
+#     python -m venv qwen_omni_venv
+#     source qwen_omni_venv/bin/activate
+#     # If you previously installed CPU-only torch into this venv, uninstall it
+#     # first so the +cu121 wheels below replace it cleanly:
+#     pip uninstall -y torch torchvision
+#     pip install -r qwen2_5_omni_requirements.txt
+#
+# System prerequisite: `ffmpeg` must be on $PATH (decord / pyav use it for
+# audio extraction from video).
+#
+# Pins below follow the Qwen2.5-Omni README:
+#   https://github.com/QwenLM/Qwen2.5-Omni
+
+# --- core model + processor ---
+# Without one of {transformers==4.52.3, transformers @ v4.51.3-Qwen2.5-Omni-preview}
+# the from_pretrained call raises KeyError: 'qwen2_5_omni'.
+transformers==4.52.3
+accelerate>=0.30
+huggingface_hub>=0.25
+
+# --- multimodal helpers required by the model ---
+qwen-omni-utils[decord]
+soundfile
+librosa
+av
+decord
+
+# --- torch + torchvision, CUDA 12.4 wheels ---
+# The `+cu124` local-version specifier forces pip to use the PyTorch wheel
+# index (PyPI only serves CPU-only wheels for these versions). PyTorch
+# dropped `cu121` wheels starting at 2.6 — only cu124 / cu126 are published
+# on the index. If your host CUDA is 12.6, swap `cu124` -> `cu126` below.
+#
+# torch must be >=2.6: Qwen2.5-Omni's from_pretrained path relies on the
+# torch.load `weights_only=True` default that was only made safe in 2.6.
+# (Earlier: transformers 4.52.3's `post_init` also requires >=2.5 because of
+# `ALL_PARALLEL_STYLES`. 2.6 covers both.)
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+
+# --- numerical / plotting / utilities ---
+numpy==2.0.0
+matplotlib
+seaborn
+pandas
+pyarrow
+tqdm
+nltk
+
+# --- optional flash-attention (eval only — analyze_attention_bias needs eager) ---
+# pip install flash-attn --no-build-isolation
