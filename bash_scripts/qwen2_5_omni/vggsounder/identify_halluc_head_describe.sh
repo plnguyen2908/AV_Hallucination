@@ -4,10 +4,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 MODEL_PATH="Qwen/Qwen2.5-Omni-7B"
-MODAL_TYPE="a"
-VIDEO_FOLDER="$ROOT_DIR/data/AudioSet/audios"
-INPUT_FILE="$ROOT_DIR/results/qwen2_5_omni/AudioSet_describe/sampled_entities.json"
-OUTPUT_PATH="$ROOT_DIR/results/qwen2_5_omni/AudioSet_describe/attribution"
+MODAL_TYPE="av"
+VIDEO_FOLDER="$ROOT_DIR/data/VGGSounder/videos"
+INPUT_FILE="$ROOT_DIR/results/qwen2_5_omni/VGGSounder_describe/sampled_entities.json"
+OUTPUT_PATH="$ROOT_DIR/results/qwen2_5_omni/VGGSounder_describe/attribution"
 INFLUENCE_SCORE="prob_diff" # options: prob_diff, abs_prob_diff, log_prob_diff
 
 CUDA_VISIBLE_DEVICES=0,1,2,3 python "$ROOT_DIR/method/qwen2_5_omni/identify_halluc_head.py" \

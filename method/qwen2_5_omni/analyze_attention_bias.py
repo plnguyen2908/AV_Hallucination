@@ -29,16 +29,32 @@ from utils import build_conversation, find_modality_spans, load_omni
 _HERE = Path(__file__).parent
 _REPO = _HERE.parent.parent
 
-DESCRIBE_TASKS = {"AudioSet Captioning"}
-DESCRIBE_SUFFIX = (
-    "\nRespond with ONLY a comma-separated list of labels from the list "
-    "above that match the sounds you hear. No explanations, no other words."
-)
+DESCRIBE_TASKS = {
+    "AudioSet Captioning",
+    "ActivityNet Captioning",
+    "VGGSounder Captioning",
+}
+# Per-task describe suffix; must match eval.py / identify_halluc_head.py.
+DESCRIBE_SUFFIX_BY_TASK = {
+    "AudioSet Captioning": (
+        "\nRespond with ONLY a comma-separated list of labels from the list "
+        "above that match the sounds you hear. No explanations, no other words."
+    ),
+    "ActivityNet Captioning": (
+        "\nRespond with ONLY a comma-separated list of labels from the list "
+        "above that match what you see. No explanations, no other words."
+    ),
+    "VGGSounder Captioning": (
+        "\nRespond with ONLY a comma-separated list of labels from the list "
+        "above that match what you see and hear. No explanations, no other words."
+    ),
+}
 
 
 def apply_qwen_prompt_suffix(prompt: str, task: str) -> str:
-    if task in DESCRIBE_TASKS and DESCRIBE_SUFFIX not in prompt:
-        return prompt + DESCRIBE_SUFFIX
+    suffix = DESCRIBE_SUFFIX_BY_TASK.get(task)
+    if suffix and suffix not in prompt:
+        return prompt + suffix
     return prompt
 
 
@@ -98,9 +114,13 @@ def eval_model(args):
             "AudioSet Multiple-Choice",
         }
     elif modal_type == "v":
-        task_filter = {"Video Captioning"}
+        task_filter = {"Video Captioning", "ActivityNet Captioning"}
     else:  # "av"
-        task_filter = {"AV Captioning"}
+        task_filter = {
+            "AV Captioning",
+            "ActivityNet Captioning",
+            "VGGSounder Captioning",
+        }
 
     with open(args.input_file) as f:
         samples = json.load(f)

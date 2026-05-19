@@ -10,7 +10,7 @@ from typing import Dict, List, Set
 import nltk
 import tqdm
 from nltk import pos_tag, word_tokenize
-from utils import build_conversation, load_omni, omni_infer
+from utils import build_conversation, load_omni, omni_infer, trim_chat_artifacts as _trim_chat_artifacts
 
 nltk.download("averaged_perceptron_tagger_eng")
 
@@ -35,7 +35,11 @@ HALLUC_TASKS: Set[str] = {
     "Audio-driven Video Hallucination",
 }
 MCQ_TASKS: Set[str] = {"AudioSet Multiple-Choice"}
-DESCRIBE_TASKS: Set[str] = {"AudioSet Captioning"}
+DESCRIBE_TASKS: Set[str] = {
+    "AudioSet Captioning",
+    "ActivityNet Captioning",
+    "VGGSounder Captioning",
+}
 NLTK_CAPTIONING_TASKS: Set[str] = {
     "AV Captioning",
     "Audio Captioning",
@@ -50,10 +54,24 @@ DISCRETE_TASKS: Set[str] = HALLUC_TASKS | MCQ_TASKS
 
 # Constrain Qwen on the describe variant: instead of a freeform caption, ask
 # for a single sentence built from the provided labels.
-DESCRIBE_SUFFIX = (
-    "\nRespond with ONLY a comma-separated list of labels from the list "
-    "above that match the sounds you hear. No explanations, no other words."
-)
+# Per-task describe suffix, picked by modality:
+#   AudioSet      (a)  → "sounds you hear"
+#   ActivityNet   (v)  → "what you see"
+#   VGGSounder    (av) → "what you see and hear"   (planned)
+DESCRIBE_SUFFIX_BY_TASK: Dict[str, str] = {
+    "AudioSet Captioning": (
+        "\nRespond with ONLY a comma-separated list of labels from the list "
+        "above that match the sounds you hear. No explanations, no other words."
+    ),
+    "ActivityNet Captioning": (
+        "\nRespond with ONLY a comma-separated list of labels from the list "
+        "above that match what you see. No explanations, no other words."
+    ),
+    "VGGSounder Captioning": (
+        "\nRespond with ONLY a comma-separated list of labels from the list "
+        "above that match what you see and hear. No explanations, no other words."
+    ),
+}
 
 
 # Grammar for shallow noun-phrase chunking: ONE OR MORE noun tags only.
@@ -127,42 +145,35 @@ def extract_entity(text: str) -> List[str]:
 def find_labels_in_text(text: str, labels: List[str]) -> List[str]:
     """Whole-word, case-insensitive scan of `text` for entries in `labels`.
 
-    Used for the AudioSet describe variant: the GT vocabulary is closed, so
-    NLTK POS tagging is unnecessary."""
+    Used for the describe variants (AudioSet / ActivityNet): the GT
+    vocabulary is closed, so NLTK POS tagging is unnecessary.
+
+    Longest-match wins: if "Playing beach volleyball" matches, the
+    contained "Volleyball" label is suppressed. Otherwise scanning the
+    full 200/500-label vocab against the model output produces spurious
+    sub-label hits whenever one label is a substring of another."""
     text_lc = text.lower()
-    hits: List[str] = []
+    spans = []  # (start, end, lbl)
     for lbl in labels:
         pattern = r"(?<![a-z0-9])" + re.escape(lbl.lower()) + r"(?![a-z0-9])"
-        if re.search(pattern, text_lc):
-            hits.append(lbl)
-    return hits
+        for m in re.finditer(pattern, text_lc):
+            spans.append((m.start(), m.end(), lbl))
+    # Take longest matches first; any shorter span fully contained inside
+    # an already-accepted span is dropped.
+    spans.sort(key=lambda s: -(s[1] - s[0]))
+    accepted: list = []
+    for start, end, lbl in spans:
+        contained = any(s <= start and end <= e for s, e, _ in accepted)
+        if not contained:
+            accepted.append((start, end, lbl))
+    # Return in textual order so the debug print reads intuitively.
+    accepted.sort(key=lambda s: s[0])
+    return [lbl for _, _, lbl in accepted]
 
 
-def trim_chat_artifacts(text: str) -> str:
-    """Truncate Qwen2.5-Omni output at the first occurrence of any common
-    chat-template leakage marker. The composite model sometimes continues
-    past its turn into a fake user / assistant chat-template block, e.g.
-    "...distortion. What\\nHuman: What: I'm thinking of getting a new guitar..."
-    The fake continuation pollutes entity extraction; this strips it."""
-    if not text:
-        return text
-    markers = (
-        "\nHuman:",
-        "\nuser:",
-        "\nUser:",
-        "\nAssistant:",
-        "\nassistant:",
-        "Human:",
-        "<|im_end|>",
-        "<|im_start|>",
-        "<|endoftext|>",
-    )
-    earliest = len(text)
-    for m in markers:
-        idx = text.find(m)
-        if 0 <= idx < earliest:
-            earliest = idx
-    return text[:earliest].rstrip()
+# Re-exported from utils so the rest of eval.py can refer to it without the
+# alias underscore. utils.trim_chat_artifacts is the canonical implementation.
+trim_chat_artifacts = _trim_chat_artifacts
 
 
 def find_last_valid_answer(output: str, valid: tuple) -> str:
@@ -212,12 +223,28 @@ def get_entity_labels_for_entry(entry: dict) -> dict:
             _add(ent, seen)
 
     elif task in DESCRIBE_TASKS:
+        items: list[str]
         if isinstance(label, list):
-            result["gt_entities"].extend(str(l).strip().lower() for l in label)
+            items = [str(l) for l in label]
         else:
-            result["gt_entities"].extend(
-                s.strip().lower() for s in str(label).split(",") if s.strip()
-            )
+            items = str(label).split(",")
+        seen: set = set()
+        for item in items:
+            item_lc = item.strip().lower()
+            if not item_lc or item_lc in seen:
+                continue
+            result["gt_entities"].append(item_lc)
+            seen.add(item_lc)
+            # Some VGGSounder labels are themselves comma-joined synonyms,
+            # e.g. "male speech, man speaking". Split on internal commas so a
+            # model output that names just one half ("male speech") still
+            # matches the GT.
+            if "," in item_lc:
+                for piece in item_lc.split(","):
+                    piece = piece.strip()
+                    if piece and piece not in seen:
+                        result["gt_entities"].append(piece)
+                        seen.add(piece)
 
     elif task in NLTK_CAPTIONING_TASKS:
         for entity in extract_entity(str(label)):
@@ -247,19 +274,33 @@ def main(args):
         len(by_task[t]) > 0 for t in active_tasks if t in DESCRIBE_TASKS
     )
     if needs_labels:
-        labels_path = args.audioset_labels_file or os.path.join(
-            os.path.dirname(args.QA_FILE), "audioset_labels.txt"
-        )
-        if not os.path.exists(labels_path):
+        if args.audioset_labels_file:
+            labels_path = args.audioset_labels_file
+        else:
+            # Auto-detect: look for a labels file next to QA.json. AudioSet
+            # describe writes audioset_labels.txt; ActivityNet describe
+            # writes activitynet_labels.txt.
+            qa_dir = os.path.dirname(args.QA_FILE)
+            labels_path = None
+            for fname in (
+                "audioset_labels.txt",
+                "activitynet_labels.txt",
+                "vggsounder_labels.txt",
+            ):
+                cand = os.path.join(qa_dir, fname)
+                if os.path.exists(cand):
+                    labels_path = cand
+                    break
+        if not labels_path or not os.path.exists(labels_path):
             raise FileNotFoundError(
-                f"AudioSet describe entries are present but the labels file "
-                f"was not found at {labels_path}. Generate it via "
-                f"`python method/preprocess_AudioSet.py --variant describe` "
-                f"or pass --audioset_labels_file."
+                "Describe entries are present but no labels file was found "
+                f"next to {args.QA_FILE} (looked for audioset_labels.txt / "
+                "activitynet_labels.txt). Generate via the matching "
+                "preprocess script or pass --audioset_labels_file."
             )
         with open(labels_path) as f:
             audioset_labels = [line.strip() for line in f if line.strip()]
-        print(f"Loaded {len(audioset_labels)} AudioSet labels from {labels_path}")
+        print(f"Loaded {len(audioset_labels)} describe labels from {labels_path}")
 
     sampled_by_task: Dict[str, List[dict]] = {}
     sampled_video_ids: Set[str] = set()
@@ -345,8 +386,9 @@ def main(args):
 
         video_path = os.path.join(args.video_folder, record["video"])
         question = record["question"]
-        if task in DESCRIBE_TASKS and DESCRIBE_SUFFIX not in question:
-            question = question + DESCRIBE_SUFFIX
+        describe_suffix = DESCRIBE_SUFFIX_BY_TASK.get(task)
+        if describe_suffix and describe_suffix not in question:
+            question = question + describe_suffix
             # Persist so identify_halluc_head / analyze_attention_bias
             # reconstruct the same prompt that produced `generated_caption`.
             record["question"] = question
@@ -403,7 +445,20 @@ def main(args):
                 entities.append(detected)
             output_entities = entities
         elif task in DESCRIBE_TASKS:
-            output_entities = find_labels_in_text(output, audioset_labels)
+            # Closed-vocab label matches first (canonical case).
+            label_matches = find_labels_in_text(output, audioset_labels)
+            output_entities = list(label_matches)
+            # Plus NLTK noun phrases from the rest of the response, so
+            # off-vocab outputs like "Brush brush hair" still surface as
+            # entities and get classified (against gt_entities) — typically
+            # as hallucinated, since they don't match the GT label string.
+            matched_lc = [lm.lower() for lm in label_matches]
+            for np in extract_entity(output):
+                np_lc = np.lower()
+                # Skip NPs already covered by a matched label.
+                if any(np_lc in lm for lm in matched_lc):
+                    continue
+                output_entities.append(np)
         else:
             output_entities = extract_entity(output)
 

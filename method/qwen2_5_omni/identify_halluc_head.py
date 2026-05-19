@@ -11,31 +11,50 @@ import seaborn as sns
 import torch
 from head_attribution import set_zero_ablation_greedy_search
 from tqdm import tqdm
-
-from utils import build_conversation, load_omni, prepare_inputs, thinker_text_config
-
+from utils import (
+    build_conversation,
+    load_omni,
+    prepare_inputs,
+    thinker_text_config,
+    trim_chat_artifacts,
+)
 
 _HERE = Path(__file__).parent
 _REPO = _HERE.parent.parent
 
-DESCRIBE_TASKS = {"AudioSet Captioning"}
-DESCRIBE_SUFFIX = (
-    "\nRespond with ONLY a comma-separated list of labels from the list "
-    "above that match the sounds you hear. No explanations, no other words."
-)
+DESCRIBE_TASKS = {
+    "AudioSet Captioning",
+    "ActivityNet Captioning",
+    "VGGSounder Captioning",
+}
+# Per-task describe suffix, keyed by modality (a / v / av). Must match
+# eval.py's DESCRIBE_SUFFIX_BY_TASK exactly so the prompt rebuilt here
+# reproduces the saved `generated_caption`.
+DESCRIBE_SUFFIX_BY_TASK = {
+    "AudioSet Captioning": (
+        "\nRespond with ONLY a comma-separated list of labels from the list "
+        "above that match the sounds you hear. No explanations, no other words."
+    ),
+    "ActivityNet Captioning": (
+        "\nRespond with ONLY a comma-separated list of labels from the list "
+        "above that match what you see. No explanations, no other words."
+    ),
+    "VGGSounder Captioning": (
+        "\nRespond with ONLY a comma-separated list of labels from the list "
+        "above that match what you see and hear. No explanations, no other words."
+    ),
+}
 
 
 def apply_qwen_prompt_suffix(prompt: str, task: str) -> str:
-    """Mirror eval.py: append the describe-variant format suffix if not
-    already present, so the prompt rebuilt here matches what produced the
-    saved `generated_caption`."""
-    if task in DESCRIBE_TASKS and DESCRIBE_SUFFIX not in prompt:
-        return prompt + DESCRIBE_SUFFIX
+    suffix = DESCRIBE_SUFFIX_BY_TASK.get(task)
+    if suffix and suffix not in prompt:
+        return prompt + suffix
     return prompt
 
 
 def _heatmap(data, ax, title=None, hal_heads=None, non_hal_heads=None):
-    v_limit = np.percentile(np.abs(data), 99.0)
+    v_limit = np.percentile(np.abs(data), 99.9)
     sns.heatmap(
         data,
         cmap="coolwarm",
@@ -168,6 +187,11 @@ def main(args):
                 skip_special_tokens=True,
                 clean_up_tokenization_spaces=False,
             )[0].strip()
+            # Match eval.py — the saved `generated_caption` was already
+            # cleaned of chat-template leakage (e.g. "Hand\nHuman: What's
+            # the most interesting thing..."), so apply the same trim here
+            # before comparing.
+            generated_text = trim_chat_artifacts(generated_text)
 
             expected_text = line.get("generated_caption", "").strip()
             assert generated_text == expected_text, (
@@ -345,9 +369,7 @@ if __name__ == "__main__":
         default=str(_REPO / "data/AudioSet/audios"),
     )
     parser.add_argument("--model_path", type=str, default="Qwen/Qwen2.5-Omni-7B")
-    parser.add_argument(
-        "--modal_type", type=str, default="a", choices=["a", "v", "av"]
-    )
+    parser.add_argument("--modal_type", type=str, default="a", choices=["a", "v", "av"])
     parser.add_argument(
         "--output_path",
         type=str,

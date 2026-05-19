@@ -57,20 +57,42 @@ def load_omni(
     return model, processor
 
 
-def build_conversation(media_path: str, question: str, modal_type: str) -> list:
+# Default sampling caps for video inputs. Qwen2.5-Omni's stock video
+# preprocessing samples at 2 fps with no pixel ceiling, so even a 20s clip
+# can produce thousands of visual tokens and OOM on a single forward.
+# 1 fps + ~230k pixels/frame gives ~300 spatial tokens × 20 frames ≈ 6k
+# visual tokens, which fits comfortably alongside the prompt.
+VIDEO_FPS_DEFAULT = 1.0
+VIDEO_MAX_PIXELS_DEFAULT = 360 * 640
+
+
+def build_conversation(
+    media_path: str,
+    question: str,
+    modal_type: str,
+    video_fps: float = VIDEO_FPS_DEFAULT,
+    video_max_pixels: int = VIDEO_MAX_PIXELS_DEFAULT,
+) -> list:
     """Build the chat-template message list for one sample.
 
     modal_type ∈ {"a","v","av"}. For "av" we pass the video and tell the
     processor to read its audio track via use_audio_in_video=True — no
     separate "audio" content item.
+
+    `video_fps` and `video_max_pixels` cap the visual token count for the
+    "v" / "av" cases. The qwen-omni-utils processor reads these directly
+    off the video content dict.
     """
     user_content: list = []
     if modal_type == "a":
         user_content.append({"type": "audio", "audio": media_path})
-    elif modal_type == "v":
-        user_content.append({"type": "video", "video": media_path})
-    elif modal_type == "av":
-        user_content.append({"type": "video", "video": media_path})
+    elif modal_type in ("v", "av"):
+        user_content.append({
+            "type": "video",
+            "video": media_path,
+            "fps": video_fps,
+            "max_pixels": video_max_pixels,
+        })
     else:
         raise ValueError(f"Unknown modal_type: {modal_type!r}")
     user_content.append({"type": "text", "text": question})
@@ -127,6 +149,40 @@ def omni_infer(
     return processor.batch_decode(
         gen_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
     )[0].strip()
+
+
+_CHAT_LEAK_MARKERS = (
+    "\nHuman:",
+    "\nuser:",
+    "\nUser:",
+    "\nAssistant:",
+    "\nassistant:",
+    "Human:",
+    "<|im_end|>",
+    "<|im_start|>",
+    "<|endoftext|>",
+)
+
+
+def trim_chat_artifacts(text: str) -> str:
+    """Truncate Qwen2.5-Omni output at the first occurrence of any common
+    chat-template leakage marker.
+
+    The composite model sometimes continues past its own turn into a fake
+    user / assistant block, e.g. "Hand\\nHuman: What's the most interesting
+    thing you've seen in a video?". eval.py applies this to the raw model
+    output before saving `generated_caption`; identify_halluc_head.py applies
+    it to the regenerated string before comparing against
+    `generated_caption` — otherwise the assertion blows up on every
+    chatty sample."""
+    if not text:
+        return text
+    earliest = len(text)
+    for m in _CHAT_LEAK_MARKERS:
+        idx = text.find(m)
+        if 0 <= idx < earliest:
+            earliest = idx
+    return text[:earliest].rstrip()
 
 
 def thinker_layers(model):

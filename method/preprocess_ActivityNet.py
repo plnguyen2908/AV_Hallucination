@@ -132,7 +132,7 @@ def build_entry_describe(
         "video_id": video_id,
         "task": TASK_DESCRIBE,
         "text": (
-            "Watch the video and identify the action being performed. "
+            "Watch the video and describe what you see. "
             "Choose only from the following ActivityNet action labels: "
             + ", ".join(options) + "."
         ),
