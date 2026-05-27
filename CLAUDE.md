@@ -4,127 +4,117 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This research project investigates **hallucination attribution in Audio-Visual (AV) large multimodal models**, specifically VideoLLaMA2. The goal is to identify which attention heads are responsible for hallucinated outputs on the AVHBench benchmark, adapting the methodology from the [Hallucination-Attribution](Hallucination-Attribution/) paper (originally for LLaVA image-language models) to AV models.
+This research project studies **attention sinks and hallucination in Audio-Visual large multimodal models**, primarily **Qwen2.5-Omni-7B**. There are two interlocking research lines:
+
+1. **Hallucination-head attribution** — identify which decoder attention heads drive hallucinated tokens, via per-head zero-ablation. Adapted from the [Hallucination-Attribution](Hallucination-Attribution/) paper (ICLR 2025, originally LLaVA image-language models). Run separately on audio-only, video-only, and audio-visual probes, then combined to categorize heads by modality.
+
+2. **Sink analysis** (`method/sink_analysis/`) — test whether Qwen2.5-Omni inherits the *encoder→LLM propagated-sink* phenomenon (high-norm encoder tokens becoming LLM attention sinks) for audio and video. This is grounded in three papers:
+   - **To Sink or Not to Sink** (arXiv 2510.08510) — ViT high-norm "sink" tokens (L2 norm > τ=100, ~3–5/image) get ~7× LLM attention and propagate from encoder through the connector into the LLM. Source of the Figure 3A reproduction and the propagation thresholds.
+   - **See What You Are Told: Visual Attention Sink / VAR** (arXiv 2503.03321) — sink tokens defined by massive activation in fixed hidden-state "sink dimensions"; basis of `identify_sink_dimensions.py`. The "wasted attention" counter-view.
+   - **Probing Cross-modal Information Hubs in AV-LLMs / ASD** (arXiv 2605.10815) — AV-LLM sink tokens carry cross-modal info; Adaptive Sink-Guided Decoding on Qwen2.5-Omni. The closest AV precedent.
+
+> **Earlier work used VideoLLaMA2** on AVHBench; that pipeline still lives in `method/videollama2/` and is documented under "Prior work (VideoLLaMA2)" below. New work targets Qwen2.5-Omni.
 
 ## Repository Structure
 
-- **`VideoLLaMA2/`** — Vendored copy of the VideoLLaMA2 model codebase (installed as a local package). The `videollama2` Python package is imported from here.
-- **`method/videollama2/`** — Core pipeline scripts for this project:
-  - `eval.py` — Stage 1: Run VideoLLaMA2 inference on AVHBench, sample entities, classify tokens as hallucinated vs. non-hallucinated using NLTK POS tagging.
-  - `identify_halluc_head.py` — Stage 2: Run zero-ablation attribution per attention head for each hallucinated/non-hallucinated token.
-  - `head_attribution.py` — Monkey-patches `transformers.GenerationMixin._sample` to perform per-head zero-ablation during generation.
-- **`bash_scripts/videollama2/`** — Shell wrappers for running the pipeline.
-- **`Hallucination-Attribution/`** — The original paper's code (LLaVA-based), used as reference for attribution methodology, baselines, and analysis scripts.
-- **`results/videollama2/AVHBench/`** — Output directory for inference results and attribution `.pth` files + heatmap PNGs.
-- **`data/AVHBench/`** — Dataset (gitignored). Expected structure: `QA.json` and `videos/` directory.
+- **`method/qwen2_5_omni/`** — Primary pipeline (the `qwen_omni_venv` runs these):
+  - `utils.py` — `load_omni` (composite `Qwen2_5OmniForConditionalGeneration`, talker disabled so only the **thinker** = encoders + LLM is used; `attn_implementation="eager"`, bfloat16, `device_map="auto"`), `build_conversation`, `prepare_inputs`, `find_modality_spans`, `omni_infer`.
+  - `eval.py` — Stage 1: run inference on a dataset, sample entities, label tokens hallucinated vs. non-hallucinated (NLTK POS tagging, GT comparison). → `sampled_entities.json`.
+  - `identify_halluc_head.py` — Stage 2: per-head zero-ablation attribution. → per-sample `.pth`, heatmaps, `attribution/heads/attribution_result.json`.
+  - `head_attribution.py` — monkey-patches `GenerationMixin._sample` to zero-ablate each thinker head during generation (ports the VideoLLaMA2 version; enumerates `o_proj` via the thinker's decoder layers so encoder o_projs are untouched).
+  - `analyze_attention_bias.py` — Stage 3: forward pass with `output_attentions=True`, measure hal vs. non-hal heads' attention to video / audio / text spans (`find_modality_spans`, single thinker forward).
+  - `av_fusion_categorize_exp.py` / `av_fusion_scatter_exp.py` / `av_fusion_heatmap_exp.py` — combine the three single/dual-modality attribution runs (A=AudioSet, V=ActivityNet, AV=VGGSounder) to categorize heads by modality (8 disjoint cells from the `(in_H_A, in_H_V, in_H_AV)` signature at a pooled-percentile threshold).
+- **`method/sink_analysis/qwen2_5_omni/`** — Sink-analysis stages:
+  - `token_position_bookkeeping.py` — **Stage 0.2**: document audio/video/system/query/generated span indices per clip. → `token_layout.md`.
+  - `encoder_norm_bimodality_exp.py` — **Stage 1.1**: per-token L2 norms at encoder output; caches `encoder_norms.npz` (`{audio,video}_{flat,offsets,names}`).
+  - `encoder_norm_global_threshold_exp.py` — **Stage 1.1 (v2)**: global-percentile thresholding of the cached norms (no per-clip self-suppression).
+  - `encoder_to_llm_propagation_exp.py` — **Stage 1.2**: reproduce Sink-or-Not Figure 3A — bin encoder norms (width 5), measure LLM attention to each modal token from generated query positions at layers 2 & 14, decide framing (A/B/C). See "Sink analysis" below.
+  - `identify_sink_dimensions.py` — find LLM hidden-state sink dimensions (VAR-paper method). → `sink_dimensions.csv`.
+- **`bash_scripts/qwen2_5_omni/{audioset,activitynet,vggsounder}/`** — Shell wrappers (eval / identify_halluc_head / analyze_attention_bias, with `_describe` and `_mcq` variants).
+- **`Hallucination-Attribution/`** — Original ICLR 2025 LLaVA code (attribution methodology, baselines VCD/DOLA/HALC/OPERA, interventions ADHH/TFHH).
+- **`results/qwen2_5_omni/`** — Outputs: `AudioSet[_describe]/`, `ActivityNet_describe/`, `VGGSounder_describe/` (each with `sampled_entities.json`, `attribution/`, `attention_bias/`), `categorize_exp/`, `sink_analysis/`.
+- **`data/`** (gitignored) — see "Datasets" below.
+- **`method/videollama2/`, `bash_scripts/videollama2/`, `results/videollama2/`** — Prior work (see bottom).
 
 ## Environment Setup
 
-The project uses a dedicated venv at `/nobackup/le/AV_Hallucination/videollama2_venv` (on the compute cluster). Install VideoLLaMA2 as a local editable package:
+Three dedicated venvs at the repo root **`/nobackup3/le/AV_Hallucination/`**:
+
+- **`qwen_omni_venv`** — primary; runs all `method/qwen2_5_omni/` and `method/sink_analysis/` scripts. (torch 2.6.0 + cu124, recent `transformers` with `Qwen2_5Omni*`, `qwen_omni_utils`.)
+- **`activitynet_venv`** — ActivityNet data prep.
+- **`videollama2_venv`** — prior VideoLLaMA2 pipeline (torch 2.2.0, transformers 4.42.3).
+
+Invoke the venv Python directly, e.g.:
 
 ```bash
-cd VideoLLaMA2
-pip install -e .
+/nobackup3/le/AV_Hallucination/qwen_omni_venv/bin/python method/sink_analysis/qwen2_5_omni/encoder_to_llm_propagation_exp.py
 ```
 
-Key dependency pinning (see `VideoLLaMA2/requirements.txt`):
-- `torch==2.2.0`, `transformers==4.42.3`, `accelerate==0.26.1`
-- `decord`, `librosa`, `pytorchvideo` for AV processing
+The 7B model fits on a single 24 GB GPU for attention work; the bash wrappers default to `CUDA_VISIBLE_DEVICES=0,1,2,3` for eval throughput.
 
-## Running the Pipeline
+## Datasets
 
-### Stage 1 — Inference & Entity Extraction
+Per-modality probes (`data/`, gitignored). Each has `QA.json` + a media dir; `_describe` / `_mcq` variants share the same media and differ only in `QA.json` and the labels file.
+
+| Dataset | `modal_type` | Modality | Media |
+|---|---|---|---|
+| AudioSet | `a` | audio-only | `data/AudioSet/audios/*.wav` |
+| ActivityNet | `v` | video-only | `data/ActivityNet/videos/*.mp4` |
+| VGGSounder | `av` | audio-visual (audio extracted from the video via `use_audio_in_video=True`) | `data/VGGSounder/videos/*.mp4` |
+
+Also present: `AVHBench`, `AVCaps`, `MSVD`, `VGGSound` (used by the prior VideoLLaMA2 work and some eval variants).
+
+## Running the Qwen2.5-Omni Pipeline
 
 ```bash
-bash bash_scripts/videollama2/eval.sh
+# Stage 1 — inference + entity labeling
+bash bash_scripts/qwen2_5_omni/audioset/eval_describe.sh
+# Stage 2 — per-head zero-ablation attribution
+bash bash_scripts/qwen2_5_omni/activitynet/identify_halluc_head_describe.sh
+# Stage 3 — attention-bias analysis
+bash bash_scripts/qwen2_5_omni/vggsounder/analyze_attention_bias_describe.sh
 ```
 
-Runs `method/videollama2/eval.py`. Samples `N_PER_CATEGORY` (default 100) entries per AVHBench task category, runs VideoLLaMA2 inference, extracts noun/yes/no entities, and labels them as hallucinated or not by comparing against ground truth. Output: `results/videollama2/AVHBench/sampled_entities.json`.
+`identify_halluc_head.sh` sets `INFLUENCE_SCORE` ∈ {`prob_diff` (default), `abs_prob_diff`, `log_prob_diff`}.
 
-### Stage 2 — Head Attribution
+After running the three single/dual-modality attribution probes, combine them:
 
 ```bash
-bash bash_scripts/videollama2/identify_halluc_head.sh
+python method/qwen2_5_omni/av_fusion_scatter_exp.py --top_k 40
+python method/qwen2_5_omni/av_fusion_heatmap_exp.py --top_k 40
+python method/qwen2_5_omni/av_fusion_categorize_exp.py
 ```
 
-Runs `method/videollama2/identify_halluc_head.py`. For each sample with hallucinated/non-hallucinated tokens, performs zero-ablation of each attention head's output during generation and measures the probability change. Output: per-question `.pth` files and heatmap PNGs in `results/videollama2/AVHBench/attribution/`.
+### How head attribution works
 
-### Influence Score Options
+`head_attribution.py` patches `GenerationMixin._sample`. At each generation step, if the next token is a target (hallucinated / non-hallucinated):
+1. Save the current `DynamicCache` key/value lengths.
+2. For every `(layer, head)`, register a `forward_pre_hook` on the thinker decoder layer's `o_proj` that zeroes that head's slice of the input.
+3. Forward pass, compute the ablated probability, restore the cache, record the influence score.
 
-Set `INFLUENCE_SCORE` in `identify_halluc_head.sh`:
-- `prob_diff` — signed probability difference (default)
-- `abs_prob_diff` — absolute probability difference
-- `log_prob_diff` — log-probability difference
+The cache-restoration step resets `pkv.key_cache[i]` / `pkv.value_cache[i]` to pre-ablation lengths before each ablation pass — fixing the `DynamicCache`-growth tensor-size mismatch (see `ERROR.md`).
 
-## How Head Attribution Works
+## Sink Analysis (Stages 0.2 → 1.1 → 1.2 → 1.3)
 
-`head_attribution.py` monkey-patches `GenerationMixin._sample` with `zero_ablation_sample`. At each generation step, if the next token is a target (hallucinated or non-hallucinated), it:
-1. Saves the current `DynamicCache` key/value lengths.
-2. For every `(layer, head)` pair, registers a `forward_pre_hook` on the corresponding `o_proj` module that zeroes out that head's slice of the input.
-3. Runs a forward pass, computes the ablated probability, restores the cache, and records the influence score.
+Goal: determine whether Qwen2.5-Omni's audio and video encoders inherit the **encoder→LLM propagated sink** phenomenon (Sink-or-Not, CLIP-ViT ~7×).
 
-**Known issue (see `ERROR.md`):** A tensor size mismatch (`RuntimeError: size of tensor a (3003) must match tensor b (2219)`) occurs during ablation passes when `DynamicCache` grows beyond the original sequence length. The cache restoration logic in `head_attribution.py` addresses this by resetting `pkv.key_cache[i]` and `pkv.value_cache[i]` to their pre-ablation lengths before each ablation pass.
+**Results are organized per stage** under `results/qwen2_5_omni/sink_analysis/`:
+- `stage0_2_token_bookkeeping/` — `token_layout.md`
+- `stage1_1_encoder_norms/` — `encoder_norms.npz` (the shared norm cache), `encoder_norm_histograms.png`/`_stats.txt` (bimodality), `encoder_norm_global_threshold.png`/`_summary.txt` (v2)
+- `stage1_2_propagation/` — `figure_3a_crosslayer.png` (primary), `figure_3a_layer_trajectory.png`, `figure_3a_layers_2_14.png`, `propagation_summary.csv` (cross-layer per-bin), `propagation_layers.csv` (per-layer per-bin), `propagation_metrics.csv`, `propagation_decision.txt`; `_superseded/` holds old per-layer figures
+- `sink_dimensions/` — `sink_dimensions.csv`/`.png`
 
-## AVHBench Task Categories
+Each script defaults its `--output_dir` (or `--output_md`) to its stage folder, and Stage 1.2 / 1.1-v2 default `--norms_npz` to `stage1_1_encoder_norms/encoder_norms.npz`.
 
-- `Video-driven Audio Hallucination` — model asked if audio matches video
-- `Audio-driven Video Hallucination` — model asked if video matches audio
-- `AV Captioning` — model asked to describe the video
+**Stage 1.2** (`encoder_to_llm_propagation_exp.py`) reproduces Figure 3A on 300 AudioSet + 300 ActivityNet clips. It bins encoder L2 norms (fixed width 5; fine bins are essential — coarse bins wash out the heavy-tailed high-norm tail) and measures raw, head-averaged LLM attention to each modal token from the 20 generated query positions. **Primary metric = attention averaged across ALL decoder layers + heads** (`figure_3a_crosslayer.png`); per-layer views (a trajectory heatmap and a layers-2/14 panel) are supplementary. Verdict per modality, driven by `tail_ratio` (top-3 reliable high-norm bins, token-weighted ÷ mean_attn of norm<50 bins): **≥1.5 present | 1.0–1.5 ambiguous | <1.0 none**. (`high_low_ratio` = norm>p95&reliable ÷ norm<p50 is reported alongside.)
 
-Entity labels are extracted via NLTK POS tagging (nouns + yes/no tokens). For hallucination tasks, ground truth label (Yes/No) + response nouns are compared; for captioning, GT caption nouns are used.
+The framing decision the project hinges on:
+- **(A)** both modalities propagate → symmetric two-population story (extends Sink-or-Not to AV).
+- **(B)** only video propagates → asymmetric audio-deficit story.
+- **(C)** neither → not a Sink-extension; project becomes a refinement of **ASD** (2605.10815).
 
-## Hallucination-Attribution Reference Code
+`--from_csv <propagation_summary.csv>` recomputes metrics/verdicts and regenerates all figures with no GPU. Multi-GPU note: pass `--device_map balanced_low_0` (the default) and run with all 4 GPUs visible — plain `auto` packs the model onto GPU 0 and OOMs on `output_attentions`. Do **not** normalize attention to within-modality share — use raw per-token mean attention (small ~1e-4 values are expected). **Do not proceed past Stage 1.2 until the framing is confirmed.**
 
-The `Hallucination-Attribution/` directory contains the original ICLR 2025 paper code for LLaVA models. Useful reference for:
-- Attribution methodology: `LLaVA/bash_scripts/attribute.sh`
-- Baseline comparisons (VCD, DOLA, HALC, OPERA): `baselines/`
-- Intervention methods (training-free ADHH, targeted finetuning TFHH): `baselines/bash_scripts/`
-- Analysis scripts (attention bias, inheritance, JS divergence): `LLaVA/bash_scripts/analysis/`
+## Prior work (VideoLLaMA2)
 
-## Attention Bias Analysis (Stage 3 — To Be Adapted)
-
-**Reference script**: `Hallucination-Attribution/LLaVA/eval_scripts/analyze_attention_bias.py`
-
-**Purpose**: After identifying hallucination heads via zero-ablation (Stage 2), this analysis tests the hypothesis that hallucination heads systematically over-attend to visual/audio tokens (image bias) while neglecting text context — and that non-hallucination heads show the opposite pattern. This validates *why* the identified heads cause hallucination.
-
-### What the LLaVA script does
-
-1. **Input**: CHAIR evaluation results JSON (captions with `CHAIRs == 1` are hallucinated), the identified `hal_heads` / `non_hal_heads` from `attribution_result.json`, and the image folder.
-
-2. **For each hallucinated caption**, runs a full forward pass with `output_attentions=True` to capture raw attention weight matrices `[batch, head, seq, seq]` at every layer.
-
-3. **Token segmentation**: For each generated token that is an object word in the hallucinated caption, identifies its position in the sequence and splits the preceding context into:
-   - **Image tokens**: a fixed block of 576 tokens starting at `IMAGE_TOKEN_INDEX`
-   - **Text tokens**: everything after the image block up to the current token
-
-4. **For each (layer, head) in `hal_heads` and `non_hal_heads`**, reads the attention row of the current token, sums separately over image positions and text positions, and averages across the top-k hal/non-hal heads.
-
-5. **Output**: Saves `attention_statics.pth` (list of `[hal_img_attn, hal_txt_attn, nonhal_img_attn, nonhal_txt_attn]` per hallucinated token), then plots a grouped bar chart comparing image vs. text attention for both head groups.
-
-### Key design choices to adapt for VideoLLaMA2
-
-| LLaVA | VideoLLaMA2 adaptation needed |
-|---|---|
-| Single image token block, fixed length 576 | **Two modality blocks**: video tokens (variable length, depends on num_frames × spatial patches) and audio tokens (variable length). Must locate each block dynamically from the input token sequence using `DEFAULT_VIDEO_TOKEN` / `DEFAULT_AUDIO_TOKEN` positions and the model's multimodal preprocessing output. |
-| `output_attentions=True` with eager attention | VideoLLaMA2 must also use `attn_implementation="eager"` to get attention tensors. **NaN issue**: eager attention overflows for long sequences (2201 tokens) in float16. Workaround: run this analysis in **bfloat16** (`model.to(torch.bfloat16)`) or cast QK products to float32 before softmax. Alternatively, only use this analysis pass on short sequences. |
-| COCO CHAIR metric for hallucination labels | Use `hallucinated_entities` from `sampled_entities.json` (already computed in Stage 1). Match each generated token against the entity token list. |
-| `mscoco_generated_words_first_token` — takes the second tokenizer token of each word (skips BOS) | Replicate for VideoLLaMA2 tokenizer (Qwen2): `tokenizer(word)['input_ids']` may not have a BOS; use index `[0]` or check tokenizer behavior. |
-| Loads `hal_heads` / `non_hal_heads` from `attribution_result.json` | Load from `results/videollama2/AVHBench/attribution/heads/attribution_result.json`. The key names differ: use `hal_heads_contrastive` or `hal_heads_mean` as the hal head list. |
-| Processes up to 100 samples | Tune to AVHBench sample count. |
-
-### What a VideoLLaMA2 version should measure
-
-For each hallucinated entity token generated by VideoLLaMA2:
-- **Video attention** (sum of attention weights over all video token positions)
-- **Audio attention** (sum over all audio token positions)
-- **Text attention** (sum over all text/instruction token positions)
-
-Compared separately for hal heads vs. non-hal heads. The expected finding (if the LLaVA result generalizes) is that hal heads over-attend to one modality (video or audio) at the expense of cross-modal grounding.
-
-### Implementation notes for VideoLLaMA2 token layout
-
-After `prepare_inputs_labels_for_multimodal`, the embedding sequence is approximately:
-```
-[system prompt tokens] [video tokens ~2048] [audio tokens ~variable] [instruction text tokens]
-```
-The exact boundaries are not returned by the model API — they must be inferred by running `prepare_inputs_labels_for_multimodal` separately and tracking where `None` placeholders (modal tokens) were replaced. Alternatively, count from the known modal token counts: video frames × spatial patch count, audio spectrogram frames × patch count.
+The original effort ran the same attribution idea on **VideoLLaMA2** over AVHBench. Code in `method/videollama2/` (`eval.py`, `identify_halluc_head.py`, `head_attribution.py`, `analyze_attention_bias.py`); wrappers in `bash_scripts/videollama2/`; install the vendored package with `cd VideoLLaMA2 && pip install -e .` into `videollama2_venv` (torch 2.2.0, transformers 4.42.3). The Qwen2.5-Omni scripts are direct ports of these. Notable VideoLLaMA2-specific gotcha preserved in `analyze_attention_bias.py`: eager attention overflows to NaN for long sequences in float16 — run in bfloat16. AVHBench task categories: *Video-driven Audio Hallucination*, *Audio-driven Video Hallucination*, *AV Captioning*.

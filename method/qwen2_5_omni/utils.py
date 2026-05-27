@@ -25,12 +25,20 @@ def load_omni(
     model_path: str,
     attn_implementation: str = "eager",
     dtype: torch.dtype = torch.bfloat16,
+    device_map: str = "auto",
+    max_memory=None,
 ):
     """Composite loader, talker disabled.
 
     `attn_implementation='eager'` is required when this pipeline runs the
     attention-bias pass (output_attentions=True). For pure eval, callers can
     pass `'flash_attention_2'` for a ~2x speedup.
+
+    `device_map` / `max_memory` are forwarded to `from_pretrained`. Note that
+    `device_map='auto'` packs the whole model onto GPU 0 when it fits there,
+    which OOMs on long-sequence `output_attentions` runs; pass
+    `device_map='balanced_low_0'` (or `max_memory` caps) to shard across all
+    visible GPUs and keep GPU 0 light for the generation overhead.
     """
     if not torch.cuda.is_available():
         raise RuntimeError(
@@ -44,13 +52,18 @@ def load_omni(
         )
     print(
         f"[load_omni] CUDA OK: {torch.cuda.device_count()} device(s), "
-        f"torch {torch.__version__} / cuda {torch.version.cuda}"
+        f"torch {torch.__version__} / cuda {torch.version.cuda}; "
+        f"device_map={device_map!r}, max_memory={max_memory}"
     )
-    model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
-        model_path,
+    from_kwargs = dict(
         torch_dtype=dtype,
-        device_map="auto",
+        device_map=device_map,
         attn_implementation=attn_implementation,
+    )
+    if max_memory is not None:
+        from_kwargs["max_memory"] = max_memory
+    model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
+        model_path, **from_kwargs
     )
     model.disable_talker()
     processor = Qwen2_5OmniProcessor.from_pretrained(model_path)
