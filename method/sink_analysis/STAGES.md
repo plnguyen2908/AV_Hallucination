@@ -30,11 +30,15 @@ bf16). Attention-capturing stages need all 4 GPUs (`--device_map balanced_low_0`
 ## Stage map
 | Stage | Script | Result folder |
 |---|---|---|
+| 0.1 — base-LLM sink dims | `identify_sink_dimensions_base.py` + `identify_sink_dimensions.py` | `sink_dimensions/` |
 | 0.2 — token bookkeeping | `token_position_bookkeeping.py` | `stage0_2_token_bookkeeping/` |
 | 1.0 — LLM sink dimensions | `identify_sink_dimensions.py` | `sink_dimensions/` |
 | 1.1 — encoder-norm bimodality | `encoder_norm_bimodality_exp.py` | `stage1_1_encoder_norms/` |
 | 1.1 v2 — global-threshold | `encoder_norm_global_threshold_exp.py` | `stage1_1_encoder_norms/` |
 | 1.2 — encoder→LLM propagation | `encoder_to_llm_propagation_exp.py` | `stage1_2_propagation/` |
+| 1.3 — hidden-state dim signatures | `stage1_3_dimension_signatures.py` (+ `_encoder_space`) | `stage1_3_dim_signatures/` |
+| 2.1 — layer-wise sink counts | `stage2_1_layer_sink_counts.py` | `stage2_1_layer_sinks/` |
+| 2.4 — temporal sink positions | `stage2_4_temporal_sink_positions.py` | `stage2_4_temporal_sinks/` |
 
 All result folders live under `results/qwen2_5_omni/sink_analysis/`. Each script
 defaults its `--output_dir` to its stage folder.
@@ -159,7 +163,171 @@ audio-vs-video asymmetry is robust regardless of metric.
 
 ---
 
+---
+
+## Stage 0.1 — Base-LLM-inherited sink dimensions (text-only Qwen2.5-7B)
+**Script** `identify_sink_dimensions_base.py` (and the corresponding Omni run
+`identify_sink_dimensions.py`, both now RMSNorm pure-normalization convention).
+
+**Method** Per-token |RMSNorm(x)[d]| at every hidden state (embedding + each
+decoder layer); per-layer flag `> 20× median`; sink dim if flagged in >50% of
+layers. The previous Stage 1.0 used raw |x|; this is the corrected version.
+
+**Findings** (100 prompts/100 audio clips, threshold 20×):
+- **D_sink_base = {458, 2570}** (text Qwen2.5-7B, 37.9× ratio, flagged 86–93% of layers)
+- **D_sink_omni = {458, 2570, 3197}** (Qwen2.5-Omni audio, 22.6× ratio).
+- **Inherited from base: {458, 2570}**; **Omni-only candidate: {3197}**.
+- Hidden dim matches (3584/3584, 28 decoder layers each).
+
+But after Stage 1.3 distinctiveness analysis, **3197 is NOT a true sink register** —
+see below.
+
+---
+
+## Stage 1.3 — Hidden-state dimension signatures (per-modality, distinctiveness)
+**Script** `stage1_3_dimension_signatures.py`. 100 VGGSounder AV clips,
+RMSNorm pure (matches Stage 0.1). Layers 2 (video peak), 14, 21 (audio peak).
+Populations: P_prop (encoder norm >100), P_llm (max over D_sink ≥20), random.
+
+**Final sink set: D_sink = {458, 2570}**. Dim 3197 dropped — distinctiveness
+analysis showed it has distinctiveness < 1 to ALL P_prop populations and is
+broadly active (highest in `(video, non_sink)` at 12.79). It's a video-content
+dim, not a sink register. With 3197 in the gate, ~40% of P_llm_video were
+3197-only false positives (P_llm_video L2: 4805 → 3100 = −35.5%; L21:
+96922 → 55106 = −43.1%).
+
+**Per-modality dimensional signatures (L2):**
+- `P_llm_video`, `P_llm_audio`: distinctively load {458, 2570} (ratios 2.8–3.0×).
+- `P_prop_video`: **NO** distinctive dim. Suppressed on {458, 2570} (act ~2.7).
+- `P_prop_audio`: 4 weakly distinctive non-sink dims [2030, 2730, 2890, 3070].
+- Dim 3197 distinctiveness: P_prop_video 0.83, P_prop_audio 0.97 (NOT distinct).
+
+**Final conclusion (Stage 1.3):** Qwen2.5-Omni's propagated sinks do **NOT**
+form a dedicated hidden-state register dimension — unlike LLaVA's
+{982, 2494, 3263}. Propagation appears in **attention** (Stage 1.2's video
+early-sharp peak) but **not** in a distinctive hidden-state register. The
+dimensional separation observed between P_prop_video and P_llm_video is
+**separation by absence**: P_prop_video fails to load the inherited register
+dims {458, 2570}, rather than activating its own propagated register.
+
+**Outputs** (`stage1_3_dim_signatures/`): `asd_sink_dim_per_modality.png`,
+`distinctiveness_top10.csv` / `distinctiveness_verdict.txt`,
+`em_inh_trajectory.png` / `.csv`, `dimension_signatures.csv`,
+`sink_dim_comparison.png`, `stage1_3_decision.txt`. `profiles.npz` (+ backup
+`profiles_dsink_3dims.npz` with the old 3-dim D_sink) supports `--replot_only`
+for no-GPU figure tweaks.
+
+---
+
+## Stage 2.1 — Layer-wise LLM sink counts (ASD Fig. 7 reproduction)
+**Script** `stage2_1_layer_sink_counts.py`. 300 VGGSounder AV clips, audio +
+video both present, D_sink = {458, 2570}, τ=20, RMSNorm pure. Per-clip per-layer
+forward hooks (no `output_hidden_states` retention) keep memory small.
+
+**Method** For each decoder layer L, count tokens crossing the LLM-sink
+criterion (`max(|RMSNorm(x)[d]|) ≥ 20` over D_sink), separately for audio and
+video token positions, separately per clip. Also intersect the per-layer sink
+mask with the **propagated** mask (encoder norm > 100) to track
+P_prop ∩ P_llm@L — i.e. how many of the encoder-propagated tokens additionally
+satisfy the LLM-sink criterion at each layer.
+
+**Findings (n=300 VGGSounder)**
+- **Audio LLM-emerged sinks** peak at L26 (~221/clip); at the Stage 1.2
+  audio-peak layer **L21 = ~100 sinks/clip** out of ~136 audio LLM tokens.
+- **Video LLM-emerged sinks** peak at L26 (~1194/clip); the Stage 1.2 video
+  early-sharp layer L2 also shows substantial count (~3100/clip across the run,
+  per the S1.3 reference table).
+- **~99 % of P_prop tokens become LLM-sinks at deep layers** for both
+  modalities — the propagated population is almost entirely absorbed into
+  the LLM-sink population by the deep layers.
+
+**Outputs** (`stage2_1_layer_sinks/`): `layer_sink_counts.csv`,
+`figure_2_1_llm_emerged.png` (audio/video per-layer means ± std),
+`figure_2_1_prop_overlap.png` (P_prop ∩ P_llm @ L with P_prop baseline),
+`per_clip_counts.npz` (replot-friendly per-clip per-layer arrays — also
+consumed by Stage 2.4's cross-stage proportion check), `stage2_1_decision.txt`.
+
+---
+
+## Stage 2.4 — Temporal position of audio late-spread sinks
+**Script** `stage2_4_temporal_sink_positions.py`. 300 AudioSet clips,
+audio-only forward (`modal_type="a"`), D_sink = {458, 2570}, τ=20, RMSNorm
+pure. Primary layer **L21** (Stage 1.2's audio late-spread peak); also captured
+at L27 for the deep-layer saturation comparison.
+
+**Question** Are audio L21 LLM-emerged sinks (i) **positional** (fixed
+locations regardless of content), (ii) **content-conditional** (clustered at
+acoustic events, varying per clip), or (iii) **distributed** (no temporal
+structure)?
+
+**Method** Per clip, hook L21's output; sink mask over the audio span only;
+record sink in-span indices + normalized positions in [0, 1). Aggregates:
+pooled marginal, per-clip KS vs uniform, per-clip IQR, per-clip sink count
+**and per-clip sink PROPORTION = sink_count / audio_span_length** (the cleaner
+content-dependence diagnostic — span-length variation that confounds the
+absolute count cancels out). Cross-stage: load Stage 2.1's
+`per_clip_counts.npz`, compute its L21 audio sink proportion on VGGSounder,
+compare to AudioSet's.
+
+**Findings (revised with proportion analysis, n=300 AudioSet)**
+| Quantity | Value |
+|---|---|
+| audio span length | 248.8 ± 8.6 tokens (essentially fixed) |
+| per-clip sink count | 183 ± 21 |
+| **per-clip sink proportion** | **0.736 ± 0.081** (range 0.52–0.93, 95% ≈ 0.58–0.90) |
+| **proportion std/mean** | **0.110** (just above the 0.10 saturation cutoff) |
+| pos-0 is a sink | 69 % of clips (contributes <1 % of the marginal) |
+| pooled marginal | flat, low (<0.05)=6.1 %, middle (0.4–0.6)=19.7 %, high (>0.95)=4.0 % |
+| per-clip KS vs uniform | median 0.062 |
+| per-clip IQR | median 0.494 (≈ uniform's 0.5) |
+| Stage 2.1 cross-check (L21 VGGSounder) | ~100 sinks/clip — same proportion modulo shorter audio span |
+
+**Interpretation — revised**
+- **Within-clip structure:** sinks are uniformly distributed along the audio
+  time axis (KS≈0.06, IQR≈0.5). No clustering at clip start / middle / end.
+  Position-0 sink frequency (69%) is a small per-clip footnote, not a marginal
+  bump.
+- **Across-clip structure:** sink **proportion** varies meaningfully across
+  clips (0.110 std/mean, range 0.52–0.93). This cross-clip variance reflects
+  genuine sink-rate variance, not span variation (span std/mean = 0.034).
+- **Cross-dataset consistency:** AudioSet's 0.736 proportion on 249-token spans
+  ≡ Stage 2.1's ~100 sinks/clip on VGGSounder's shorter audio spans — the
+  100-vs-183 absolute-count gap is span-length, not rate.
+- **Verdict:** audio late-spread at L21 is **NOT positional** (rules out the
+  "audio BOS register" hypothesis) and **NOT content-localization within
+  clips** (rules out "sinks track acoustic events"). It IS a **clip-level
+  saturation phenomenon** — a diffuse sink fill that varies in intensity
+  across clips. Stage 2.5 (acoustic correlation) is now well-motivated to
+  identify what drives the cross-clip variance.
+
+**Outputs** (`stage2_4_temporal_sinks/`): `temporal_sink_distribution.png`
+(pooled marginal), `per_clip_distribution_shape.png` (KS + IQR),
+`per_clip_count_distribution.png`, `per_clip_proportion_distribution.png`
+(sink proportion + span length), `temporal_sink_distribution_no_pos0.png`
+(position-0 sensitivity), `temporal_sink_distribution_L27.png` (deep-layer
+comparison), `per_clip_temporal_stats.csv` (incl. `sink_proportion` column),
+`per_clip_temporal_arrays.npz`, `stage2_4_decision.txt`.
+
+---
+
 ## Status & next
-- Stages 0.2, 1.0, 1.1, 1.1 v2 complete. Stage 1.2 code complete and run; **framing pending confirmation**.
-- Open methodological question surfaced by 1.2: cross-layer averaging vs early-layer-localized signal (video propagates at layer 2 but not on average).
-- **Stage 1.3** (LLM-emerged vs propagated sink disentanglement, using the {458, 2570, 3197} sink dims) is **not** started — do not proceed until the framing is confirmed.
+- Stages complete: 0.1 / 0.2 / 1.1 / 1.1 v2 / 1.2 / 1.3 / 2.1 / 2.4.
+- **Stage 1.2 framing**: per-layer pattern classification (Sharp/Spread/None).
+  Video = early-sharp at L2 (top3 5.28×, p95 ~2). Audio = late-spread at L21
+  (top3 ~0.9, p95 ~1.7). Framing B (asymmetric mechanism) per the per-layer
+  pattern logic — but at the hidden-state register level (Stage 1.3) the
+  asymmetry is "separation by absence", not LLaVA-style dedicated registers.
+- **Stage 1.3 final**: D_sink = {458, 2570}; no propagated register dim;
+  3197 reclassified as a broadly-active video-content channel.
+- **Stage 2.1**: deep-layer LLM-sink saturation; ~99 % of P_prop tokens
+  absorbed into the LLM-sink population at deep layers (both modalities).
+- **Stage 2.4**: audio L21 sinks are temporally **distributed within each
+  clip** (KS 0.062, IQR 0.494) but **clip-level saturation rate varies**
+  (proportion 0.736 ± 0.081, std/mean 0.110). Diffuse sink fill with
+  cross-clip rate variance. Rules out positional ("audio BOS register") and
+  within-clip content localization. Cross-stage check with Stage 2.1 confirms
+  proportion consistency across AudioSet/VGGSounder.
+- **Next — Stage 2.5 (motivated by 2.4)**: acoustic correlation. What
+  clip-level properties (energy, spectral content, semantic class,
+  speech-vs-noise, etc.) predict the cross-clip variance in audio sink
+  proportion? Confirm scope before starting.

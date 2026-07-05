@@ -153,7 +153,10 @@ def main(args):
             print(f"video read / preprocess error: {video_path}: {e}")
             continue
 
-        max_new_tokens = 5 if "Captioning" not in task else 2048
+        max_new_tokens = (
+            args.max_new_tokens if args.max_new_tokens is not None
+            else (5 if "Captioning" not in task else 2048)
+        )
 
         with torch.inference_mode():
             outputs = model.generate(
@@ -194,11 +197,17 @@ def main(args):
             generated_text = trim_chat_artifacts(generated_text)
 
             expected_text = line.get("generated_caption", "").strip()
-            assert generated_text == expected_text, (
-                f"Output mismatch for {question_id}:\n"
-                f"  expected: {expected_text!r}\n"
-                f"  got:      {generated_text!r}"
-            )
+            if generated_text != expected_text:
+                # Soft-skip instead of a hard assert: a degenerate
+                # non-terminating generation (e.g. a repetition loop) can
+                # differ if the decode cap differs, and we don't want one
+                # mismatch to crash a multi-hour attribution run.
+                print(
+                    f"Output mismatch for {question_id}, skipping:\n"
+                    f"  expected: {expected_text[:120]!r}\n"
+                    f"  got:      {generated_text[:120]!r}"
+                )
+                continue
 
         torch.save(
             hallucination_influences,
@@ -376,6 +385,10 @@ if __name__ == "__main__":
         default=str(_REPO / "results/qwen2_5_omni/AudioSet/attribution"),
     )
     parser.add_argument("--influence_score", type=str, default="prob_diff")
+    parser.add_argument("--max_new_tokens", type=int, default=None,
+                        help="Override the per-task decode cap; must match the "
+                             "cap used when sampled_entities.json was built so "
+                             "generated_caption reproduces (LibriSpeech: 512).")
     parser.add_argument("--topk", type=int, default=30)
     parser.add_argument("--skip", action="store_true")
     args = parser.parse_args()

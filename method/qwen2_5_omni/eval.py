@@ -39,6 +39,7 @@ DESCRIBE_TASKS: Set[str] = {
     "AudioSet Captioning",
     "ActivityNet Captioning",
     "VGGSounder Captioning",
+    "YouTubeVOS Captioning",
 }
 NLTK_CAPTIONING_TASKS: Set[str] = {
     "AV Captioning",
@@ -70,6 +71,10 @@ DESCRIBE_SUFFIX_BY_TASK: Dict[str, str] = {
     "VGGSounder Captioning": (
         "\nRespond with ONLY a comma-separated list of labels from the list "
         "above that match what you see and hear. No explanations, no other words."
+    ),
+    "YouTubeVOS Captioning": (
+        "\nRespond with ONLY a comma-separated list of labels from the list "
+        "above that match what you see. No explanations, no other words."
     ),
 }
 
@@ -286,6 +291,7 @@ def main(args):
                 "audioset_labels.txt",
                 "activitynet_labels.txt",
                 "vggsounder_labels.txt",
+                "youtubevos_labels.txt",
             ):
                 cand = os.path.join(qa_dir, fname)
                 if os.path.exists(cand):

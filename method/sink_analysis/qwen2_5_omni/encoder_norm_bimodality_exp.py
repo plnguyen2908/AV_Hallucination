@@ -33,6 +33,7 @@ Stop after this — no downstream analysis.
 
 import argparse
 import random
+import subprocess
 import sys
 from pathlib import Path
 
@@ -54,6 +55,10 @@ PROMPT_BY_MODAL = {
     "v":  "Describe what you see in detail.",
     "av": "Describe what you see and hear in detail.",
 }
+# Only video clips no longer than this (seconds) are selected, matching the audio
+# modality's ~10 s windows and keeping every clip's encoder forward within one
+# GPU. Clips above the threshold are excluded from the sample (not trimmed).
+MAX_VIDEO_SECONDS = 10.0
 
 
 # --------------------------------------------------------------------------
@@ -134,6 +139,19 @@ def _extract_tokens(output) -> torch.Tensor:
 # --------------------------------------------------------------------------
 # Per-clip norm collection
 # --------------------------------------------------------------------------
+
+def _probe_duration(path: Path):
+    """Video duration in seconds via ffprobe, or None if unreadable."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", "--", str(path)],
+            capture_output=True, text=True, timeout=30,
+        ).stdout.strip()
+        return float(out)
+    except Exception:
+        return None
+
 
 def collect_norms(model, processor, encoder_module, clips, modal_type, label):
     """Return (per_clip_norms, per_clip_names). `per_clip_names[i]` is the
@@ -334,7 +352,20 @@ def main(args):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("Loading Qwen2.5-Omni ...")
-    model, processor = load_omni(args.model_path)
+    # device_map='auto'/'balanced' crash with a cross-device mismatch on this
+    # model (some forward tensor stays on the main device while layers shard
+    # elsewhere). 'balanced_low_0' is the only multi-GPU map that works; fall
+    # back to 'auto' only when a single GPU is visible.
+    n_gpu = torch.cuda.device_count()
+    if n_gpu == 1 and args.device_map != "auto":
+        print(f"  [note] only 1 visible GPU — overriding device_map "
+              f"{args.device_map!r} → 'auto'.")
+        args.device_map = "auto"
+    model, processor = load_omni(args.model_path, device_map=args.device_map)
+    try:
+        print(f"  device_map placement: {model.hf_device_map}")
+    except AttributeError:
+        pass
     audio_mod, visual_mod = _resolve_encoders(model)
 
     # --- audio pass ---
@@ -355,7 +386,29 @@ def main(args):
     if not video_files:
         raise SystemExit(f"No .mp4 files in {video_dir}")
     random.shuffle(video_files)
-    video_clips = video_files[: args.n_clips]
+    if args.max_video_seconds and args.max_video_seconds > 0:
+        # Keep only clips no longer than the cap (matches the audio ~10 s windows
+        # and keeps every encoder forward within one GPU). Probe in shuffled order
+        # and stop once n_clips are found, so we don't ffprobe the whole folder.
+        video_clips, n_seen, n_skipped = [], 0, 0
+        for f in video_files:
+            if len(video_clips) >= args.n_clips:
+                break
+            n_seen += 1
+            dur = _probe_duration(f)
+            if dur is None:
+                n_skipped += 1
+                continue
+            if dur <= args.max_video_seconds:
+                video_clips.append(f)
+        print(f"\nDuration filter (<= {args.max_video_seconds}s): kept "
+              f"{len(video_clips)} clips after probing {n_seen} "
+              f"({n_skipped} unreadable).")
+        if len(video_clips) < args.n_clips:
+            print(f"  ⚠ only {len(video_clips)} clips <= {args.max_video_seconds}s "
+                  f"available (wanted {args.n_clips}).")
+    else:
+        video_clips = video_files[: args.n_clips]
     print(f"\nVideo pass: {len(video_clips)} clips from {video_dir}")
     video_norms, video_names = collect_norms(
         model, processor, visual_mod, video_clips, "v", "ActivityNet (video)"
@@ -440,6 +493,18 @@ if __name__ == "__main__":
         help="Directory of *.mp4 clips for the vision-encoder pass.",
     )
     p.add_argument("--n_clips", type=int, default=300)
+    p.add_argument(
+        "--device_map", default="balanced_low_0",
+        help="HF device_map. Default 'balanced_low_0' is the only multi-GPU map "
+             "that works on this model — plain 'auto'/'balanced' crash with a "
+             "cross-device mismatch. Auto-falls back to 'auto' on a single GPU.",
+    )
+    p.add_argument(
+        "--max_video_seconds", type=float, default=MAX_VIDEO_SECONDS,
+        help="Select only video clips no longer than this many seconds (matches "
+             "the audio ~10 s windows; keeps each encoder forward within one GPU). "
+             "Clips above it are excluded, not trimmed. Set 0 to disable.",
+    )
     p.add_argument(
         "--bimodal_min", type=float, default=1.0,
         help="Lower bound on median per-clip outlier count for a 'Bimodal' verdict.",

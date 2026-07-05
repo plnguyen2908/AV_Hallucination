@@ -33,6 +33,14 @@ hallucinated_entities = []
 non_hallucinated_entities = []
 inf_score_type = []
 
+# Per-sample cap on the number of ablated target tokens. A degenerate
+# repetition loop ("once" x1000) or a long confabulation can otherwise trigger
+# thousands of 784-head ablation passes inline during generation and dominate
+# the whole run. Set HALLUC_MAX_TARGETS to bound it (None = unlimited).
+import os as _os
+_MAX_TARGETS = (int(_os.environ["HALLUC_MAX_TARGETS"])
+                if _os.environ.get("HALLUC_MAX_TARGETS") else None)
+
 
 def set_tokenizer(tokenizer):
     global global_tokenizer
@@ -251,6 +259,12 @@ def _sample(
         matched_non_hal = word and any(word in ent for ent in non_hallucinated_entities)
         is_target = matched_hal or matched_non_hal
 
+        # Bound per-sample ablation work (see _MAX_TARGETS above): once the cap
+        # is hit, stop ablating further targets in this sample (generation
+        # continues normally, the token is just not attributed).
+        if is_target and _MAX_TARGETS is not None and count >= _MAX_TARGETS:
+            is_target = matched_hal = matched_non_hal = False
+
         if is_target:
             influences = [[None for _ in range(head_num)] for _ in range(layer_num)]
 
@@ -373,7 +387,12 @@ def _sample(
                     pkv.key_cache[i] = after_keys[i]
                     pkv.value_cache[i] = after_values[i]
 
-            torch.cuda.empty_cache()
+            # empty_cache() forces a GPU sync and dominates per-target time
+            # (~19s/target on the 3-GPU-sharded model). The caching allocator
+            # reuses freed single-token-forward memory anyway, so call it only
+            # periodically to bound fragmentation instead of every target.
+            if count % 16 == 0:
+                torch.cuda.empty_cache()
 
         count += 1
 

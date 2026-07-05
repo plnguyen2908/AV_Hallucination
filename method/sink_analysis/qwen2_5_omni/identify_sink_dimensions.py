@@ -9,11 +9,16 @@ indices up front is the prerequisite for the "LLM-emerged vs propagated" sink
 classification we want to do later — both populations live in the LLM hidden
 states, but they activate disjoint subsets of channels.
 
+NORM CONVENTION = RMSNorm (matching identify_sink_dimensions_base.py, so the
+Omni+audio D_sink is directly comparable to the base-LLM D_sink_base). RMSNorm
+here is pure normalization x / sqrt(mean(x^2) + eps), no learned weight.
+
 Procedure (per the spec):
   1. Run an audio-only forward pass on each of N AudioCaps-style clips with the
      fixed prompt "Describe what you hear in detail."
   2. Cache hidden states at every (layer, token position).
-  3. For each layer l, compute mean_abs[l, d] = mean |x[d]| over (clips, positions).
+  3. For each layer l, compute mean_abs[l, d] = mean |RMSNorm(x)[d]| over
+     (clips, positions).
   4. Per layer, flag dimensions where mean_abs[l, d] > MEDIAN_MULT * median.
   5. Pool: a dimension is a sink dimension if it is flagged in > LAYER_FRAC
      of layers.
@@ -51,6 +56,20 @@ SEED = 42
 PROMPT = "Describe what you hear in detail."
 
 
+def _rmsnorm_abs(hs: torch.Tensor, eps: float) -> torch.Tensor:
+    """|RMSNorm(x)| per position, pure normalization (no learned weight).
+    hs: (seq, H) float -> (seq, H). Matches identify_sink_dimensions_base.py."""
+    rms = torch.sqrt(hs.pow(2).mean(dim=-1, keepdim=True) + eps)
+    return (hs / rms).abs()
+
+
+def _thinker_rms_eps(model) -> float:
+    """rms_norm_eps of the thinker's LLM (Qwen2 text config)."""
+    cfg = model.thinker.config
+    cfg = getattr(cfg, "text_config", cfg)
+    return float(getattr(cfg, "rms_norm_eps", 1e-6))
+
+
 def main(args):
     random.seed(SEED)
     out_dir = Path(args.output_dir)
@@ -67,6 +86,8 @@ def main(args):
 
     print("Loading Qwen2.5-Omni ...")
     model, processor = load_omni(args.model_path)
+    eps = _thinker_rms_eps(model)
+    print(f"  RMSNorm convention (pure, no weight), rms_norm_eps = {eps}")
 
     # Running accumulators (allocated on the first successful forward when we
     # know L, H — we never store full hidden states across clips).
@@ -113,10 +134,10 @@ def main(args):
             count_per_dim = torch.zeros(L, dtype=torch.int64)
 
         for l, hs in enumerate(hidden_states):
-            # hs: (batch=1, seq, hidden) bf16 on GPU.
-            # Move per-layer to CPU float64 right away so we never hold a
+            # hs: (batch=1, seq, hidden) bf16 on GPU. Apply RMSNorm per position,
+            # then move per-layer to CPU float64 right away so we never hold a
             # multi-layer stack on GPU at once.
-            flat = hs[0].abs().to(torch.float64).cpu()
+            flat = _rmsnorm_abs(hs[0].float(), eps).to(torch.float64).cpu()
             sum_per_dim[l] += flat.sum(0)
             count_per_dim[l] += flat.shape[0]
 
@@ -158,8 +179,8 @@ def main(args):
         mask[sink_dims] = False
         other_mag = float(mean_over_layers[mask].mean())
         ratio = flagged_mag / max(other_mag, 1e-12)
-        print(f"  Mean |x| in flagged dims       : {flagged_mag:.4g}")
-        print(f"  Mean |x| in other   dims       : {other_mag:.4g}")
+        print(f"  Mean |RMSNorm(x)| flagged dims : {flagged_mag:.4g}")
+        print(f"  Mean |RMSNorm(x)| other   dims : {other_mag:.4g}")
         print(f"  Ratio                          : {ratio:.1f}× (target ≥10×)")
 
         consistency = fraction_flagged[sink_dims]
@@ -227,9 +248,9 @@ def main(args):
 
     ax.set_yscale("log")
     ax.set_xlabel("LLM hidden-state index (0 = embedding output, then layers 1..N)")
-    ax.set_ylabel("Mean |x[dim]| across tokens & clips")
+    ax.set_ylabel("Mean |RMSNorm(x)[dim]| across tokens & clips")
     ax.set_title(
-        f"Qwen2.5-Omni 7B sink dimensions  "
+        f"Qwen2.5-Omni 7B sink dimensions — RMSNorm  "
         f"(N={succeeded} clips, |D_sink|={len(sink_dims)})"
     )
     ax.legend(loc="best", fontsize=9, framealpha=0.85)
@@ -252,7 +273,7 @@ if __name__ == "__main__":
     )
     p.add_argument("--n_clips", type=int, default=100)
     p.add_argument(
-        "--median_mult", type=float, default=10.0,
+        "--median_mult", type=float, default=20.0,
         help="Per-layer cutoff multiplier: dim flagged if "
              "mean_abs[l, d] > median_mult * median(mean_abs[l, :]).",
     )

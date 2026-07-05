@@ -1,12 +1,15 @@
 """
 encoder_to_llm_propagation_exp.py
 
-Stage 1.2 — Encoder-to-LLM propagation analysis.
+Stage 1.2 — Encoder-to-LLM propagation analysis (PER-LAYER).
 
 Tests whether encoder-side high-norm tokens (from Stage 1.1) receive
 disproportionately high LLM attention during decoding. Reproduces
-Sink-or-Not-to-Sink Figure 3A for Qwen2.5-Omni at two layers (2 = early,
-14 = middle) on both modalities.
+Sink-or-Not-to-Sink Figure 3A for Qwen2.5-Omni at EVERY decoder layer.
+
+Layer dependence is a real phenomenon in Qwen2.5-Omni (ASD, arXiv 2605.10815,
+shows sink behavior varies strongly across layers), so we report the full
+trajectory rather than averaging it away or sampling a couple of layers.
 
 The output of this stage determines the project's framing:
     (A) Both modalities propagate           → symmetric two-population story
@@ -15,63 +18,53 @@ The output of this stage determines the project's framing:
 
 Prerequisites:
     - Stage 1.1 cached encoder_norms.npz (per-clip pre-projection norms).
-    - Same 300 clips/modality used in 1.1 (token positions must align).
-
-PRIMARY metric = CROSS-LAYER-AVERAGED attention. For each modal token we average
-its received attention over ALL decoder layers and all heads (and the 20 gen
-query positions), giving one attention number per token, then bin by encoder
-norm. The per-layer view (layers 2 & 14) is kept only as a supplementary
-breakdown — it is no longer the primary evidence.
+    - Same clips/modality used in 1.1 (token positions must align).
 
 Procedure:
-    1. Load cached norms; for each cached clip, re-run a forward pass with
-       output_attentions=True and max_new_tokens=20.
-    2. At each of the 20 generation steps, for EVERY decoder layer, take the
-       last-query-row attention averaged across heads; slice to the modal
-       columns. Average over (heads, layers, gen steps) → cross-layer per-token
-       attention. Also keep the per-layer means (for the trajectory + per-layer
-       figures). Raw values, no renormalization (matches the paper).
-    3. Align encoder norms with LLM-side modal positions if the projector
-       downsamples (chunked-mean); in practice 1:1 for Qwen2.5-Omni.
-    4. Fine-grained binning: width = 5 norm units, range [0, max_norm + 5].
-    5. PRIMARY Figure 3A on the cross-layer attention (figure_3a_crosslayer.png):
-       violet bars "Avg Attn for LLM Outputs", orange log line "Avg # of Tokens
-       per Clip", <10-token bins hatched.
-    6. Quantitative summary on the cross-layer data: n_reliable_bins (≥10),
-       Pearson r (bin-index vs mean_attn over reliable bins), high_low_ratio
-       (token-weighted mean_attn of norm>p95 & reliable ÷ norm<p50), tail_ratio
-       (top-3 reliable high-norm bins ÷ norm<50) — the verdict driver — plus the
-       audio bimodal characterization (0-10, 60-100, >120 norm windows).
-    7. Framing decision from the cross-layer verdicts.
-    8. Supplementary figures: figure_3a_layer_trajectory.png (per-(layer, norm
-       bin) attention heatmap, per-layer-normalized) and figure_3a_layers_2_14.png
-       (per-layer Figure 3A panels for layers 2 & 14).
+    1. For each cached clip, greedy-decode (to EOS) capturing, at EVERY decoder
+       layer, the last-query-row attention averaged over heads. Average over
+       (heads, generated query positions) → one attention value per (layer,
+       modal token). Raw values, no renormalization (matches the paper).
+    2. Align encoder norms with LLM-side modal positions (1:1 for Qwen2.5-Omni).
+    3. Pool tokens across clips; bin by encoder L2 norm (fixed width 5).
+    4. For every layer l in 0..n_layers-1, TWO metrics → a pattern:
+         top3_ratio = mean_attn(top-3 reliable hi-norm bins) / mean_attn(norm<50)
+         p95_ratio  = mean_attn(norm>p95) / mean_attn(norm<p50), token-weighted
+       Pattern: Sharp (top3>=2.0 AND p95>=1.2, extreme-tail concentration) |
+       Spread (p95>=1.2, broad propagation) | None (otherwise). Also reported:
+       Pearson r, n_high_tokens (>100), the τ=100 prop_ratio (mean+sum), and an
+       audio-only norm>2*median alternative.
+    5. PRIMARY figure (figure_3a_layer_trajectory.png): per modality, thick
+       top3_ratio line + thin p95_ratio line vs. layer; each layer's marker is
+       colored by its pattern (Sharp=red, Spread=orange, None=gray) with the
+       classification rule in the legend, and the dominant-pattern peak starred.
+    6. Secondary figure (figure_3a_representative_layers.png): Figure 3A panels
+       at three representative layers (early=2, middle=n//2, late=n-3).
+    7. Per-layer table (stdout + propagation_per_layer.csv):
+         modality | layer | pearson_r | top3_ratio | p95_ratio | pattern
+    8. Framing from each modality's dominant pattern + its band:
+         A        video Sharp-early + audio Sharp-early (symmetric classical)
+         B        video Sharp-early + audio Spread-anywhere (asymmetric mechanism)
+         B-strict video Sharp-early + audio None (audio doesn't propagate)
+         C        otherwise
+    9. Sanity: per-layer attention budget (system / modal / query / generated)
+       printed at every 4th layer.
 
-    --from_csv recomputes 6-8 and regenerates figures from existing CSVs with no
-    model load (propagation_summary.csv = cross-layer; propagation_layers.csv =
-    per-layer, optional, needed for the trajectory + per-layer figures).
-
-Sanity checks (before plotting):
-    - Per-modality cross-layer attention budget split among system / query /
-      modal / generated. modal_attn budget < 1% is flagged — itself a finding.
-    - Coverage of top-5 high-norm bins.
-    - One-clip alignment verification: cached norms vs cross-layer attention.
+    --from_csv recomputes 4-8 and regenerates figures from an existing
+    propagation_layers.csv with no model load / no GPU.
 
 Outputs (--output_dir, default results/qwen2_5_omni/sink_analysis/stage1_2_propagation):
-    figure_3a_crosslayer.png         PRIMARY
-    figure_3a_layer_trajectory.png   supplementary heatmap
-    figure_3a_layers_2_14.png        tertiary per-layer panels
-    propagation_summary.csv          cross-layer per-bin stats
-    propagation_layers.csv           per-layer per-bin stats (all layers)
-    propagation_metrics.csv          per-(modality, layer) summary metrics
-    propagation_decision.txt         verdicts + framing recommendation
+    figure_3a_layer_trajectory.png       PRIMARY (tail ratio vs layer)
+    figure_3a_representative_layers.png   secondary (Fig 3A at 3 layers)
+    propagation_layers.csv                per-layer per-bin stats (all layers)
+    propagation_per_layer.csv             per-(modality, layer) verdict metrics
+    propagation_decision.txt              peak verdicts + framing recommendation
 
 Stop after writing these. Do not proceed to Stage 1.3 without confirmation.
 """
 
 import argparse
 import sys
-import warnings
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -90,30 +83,63 @@ from utils import (  # noqa: E402
     find_modality_spans,
     load_omni,
     prepare_inputs,
+    thinker_layers,
 )
 
 
 SEED = 42
-N_GEN = 20
+# Decoding stops at EOS (natural caption length, typically tens of tokens, up to
+# ~200 observed). This is only a safety ceiling so a pathological clip can't run
+# away — it does NOT normally bind. Passed as thinker_max_new_tokens because the
+# composite generate() shadows the generic max_new_tokens with that kwarg.
+MAX_GEN_TOKENS = 512
 BIN_WIDTH = 5.0
 RELIABLE_MIN_TOKENS = 10        # reliability threshold for a bin
 LOW_NORM_PCT = 50.0            # low-norm regime = below this percentile of norms
 HIGH_NORM_PCT = 95.0          # high-norm regime = above this percentile (+ reliable)
-LOW50_NORM = 50.0             # "norm < 50" reference for the tail-focused metric
+LOW50_NORM = 50.0             # low-norm regime: norm < 50 (denominator)
+TAU_HIGH = 100.0              # high-norm regime: norm > 100 (Sink-or-Not-to-Sink τ)
 TAIL_TOPN = 3                 # # of highest-norm reliable bins for the tail metric
 # audio bimodal characterization windows
 LEFT_NORM_HI = 10.0           # leftmost / positional-sink bin: norm in [0, 10)
 SEC_NORM_LO, SEC_NORM_HI = 60.0, 100.0   # secondary peak window
 HITAIL_NORM = 120.0           # high-norm tail: norm > 120
-# verdict thresholds on the tail-focused metric (top3_reliable_high / mean_low)
-TAIL_PRESENT = 1.5
-TAIL_AMBIGUOUS = 1.0
+# Two-metric pattern classification thresholds:
+#   Sharp  := top3_ratio >= 2.0 AND p95_ratio >= 1.2  (extreme-tail concentration)
+#   Spread := p95_ratio >= 1.2                         (broad high-norm propagation)
+#   None   := otherwise
+TOP3_SHARP = 2.0
+P95_MIN = 1.2
+PATTERN_COLOR = {"Sharp": "#d62728", "Spread": "#ff7f0e", "None": "#999999"}
+# Representative layers for the secondary Figure 3A (early / middle / late).
+REP_EARLY = 2
+REP_LATE_OFFSET = 3           # late = n_layers - REP_LATE_OFFSET
 PROMPT_BY_MODAL = {
     "a": "Describe what you hear in detail.",
     "v": "Describe what you see in detail.",
 }
 COLOR_BAR = "#9467bd"           # violet bars (attention)
 COLOR_LINE = "#ff7f0e"          # orange line (token count)
+_MODAL_COLOR = {"audio": "#1f77b4", "video": "#d62728"}
+
+# ----------------------------------------------------------------------
+# Stage 1.2 — LLM-emerged sink (P_llm) track, merged in.
+# Encoder-norm pipeline above asks "do encoder-high-norm tokens get more
+# LLM attention?" (P_prop, the propagated sinks). This track asks the
+# DUAL question "do D_sink-activated LLM tokens get more attention?"
+# (P_llm, the LLM-emerged sinks). The two populations are mostly disjoint
+# in Qwen2.5-Omni (Stage 1.3), so the answers can differ.
+#
+# Sink criterion identical to Stage 2.1/2.2/2.4: pure RMSNorm (no learned
+# weight), max over D_sink of |RMSNorm(x)[d]| >= τ.
+D_SINK_LLM = [458, 2570]
+TAU_SINK_LLM = 20.0
+# Layers reported in the L2/L21 side-by-side panel and decision text.
+COMPARE_LAYERS_LLM = [2, 21]
+# Verdict thresholds for sink_attn / nonsink_attn ratio (mirrors the
+# encoder-norm tail-ratio cutoffs at 1.5 / 1.0).
+LLM_RATIO_PRESENT = 1.5
+LLM_RATIO_AMBIG = 1.0
 
 
 # --------------------------------------------------------------------------
@@ -194,20 +220,28 @@ def find_all_spans(input_ids, tokenizer, thinker_cfg) -> dict:
 
 
 # --------------------------------------------------------------------------
-# Per-clip processing — single forward, ALL layers + cross-layer average
+# Per-clip processing — single decode, ALL layers (per-layer attention + budget)
 # --------------------------------------------------------------------------
+
+def _is_oom(exc: BaseException) -> bool:
+    """True for CUDA out-of-memory errors. These are NOT a per-clip data
+    problem — they mean the run is over-subscribing GPU memory — so they must
+    abort the whole run rather than be silently tallied as a skipped clip."""
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    return "out of memory" in str(exc).lower()
+
 
 def process_clip(
     model, processor, clip_path: Path, modal_type: str,
-    thinker_cfg, tokenizer,
+    thinker_cfg, tokenizer, max_gen_tokens: int = MAX_GEN_TOKENS,
 ):
-    """For one clip, capture attention to every modal token from each of the
-    N_GEN generated query positions, averaged across heads, at EVERY decoder
-    layer. Returns:
+    """For one clip, capture attention to every modal token from each generated
+    query position (decode runs to EOS, capped at max_gen_tokens), averaged
+    across heads, at EVERY decoder layer. Returns:
         {
-            'xlayer_attn':   (N_llm,)  mean over (layers, heads, gen steps),
             'perlayer_attn': (n_layers, N_llm)  mean over (heads, gen steps),
-            'budget_per_step': {span: [...]}  cross-layer-averaged budget,
+            'budget_layers': {span: (n_layers,)} per-layer attention budget,
             'N_llm': int, 'n_layers': int,
         },
         spans dict, error str or None
@@ -220,6 +254,10 @@ def process_clip(
             processor, conv, modal_type, model.device, model.dtype
         )
     except Exception as e:
+        if _is_oom(e):
+            print(f"\n[FATAL] CUDA OOM preparing inputs for {clip_path.name}.",
+                  file=sys.stderr)
+            raise
         return None, None, f"prep:{e}"
 
     prompt_len = inputs["input_ids"].shape[1]
@@ -229,69 +267,151 @@ def process_clip(
         return None, spans, f"no_{mod_key}_span"
     mod_start, mod_end = spans[mod_key]
 
+    # ---- Hook-based attention capture (memory-safe) -----------------------
+    # The naive approach (output_attentions=True + return_dict_in_generate=True)
+    # makes the model RETAIN the full (heads x q_len x kv_len) probability
+    # matrix for EVERY decoder layer, all decode steps, on-device until generate
+    # returns — the step-0 prompt forward alone is O(n_layers*n_heads*S^2) in
+    # fp32 (>10 GB for long video), which OOMs.
+    #
+    # Instead: output_attentions=True still makes each eager attention module
+    # RETURN its weight tensor (modeling_qwen2_5_omni.py:1542 nulls it
+    # otherwise), but we hook every thinker decoder layer's self_attn. The hook
+    # extracts ONLY the last-query row (mean over heads) to CPU, then returns a
+    # modified output with attn_weights replaced by None — so the model never
+    # accumulates the full per-layer matrices. Peak GPU memory drops to ONE
+    # transient (1, H, q, kv) block at a time. An OOM that still occurs is a
+    # config/memory problem, not a bad clip, so _is_oom re-raises to abort.
+    layers = thinker_layers(model)
+    n_layers = len(layers)
+    captured: list = []          # per forward: list[n_layers] of (kv,) CPU arrays
+
+    # --- LLM-emerged sink mask (P_llm) capture, fires once at step 0 ---
+    # On each decoder layer's main forward output: at the prompt forward
+    # (seq_len > 1), compute is_sink for the modal-token slice via
+    # D_SINK_LLM + τ. Generation steps (seq_len = 1) are no-op.
+    text_cfg = getattr(model.thinker.config, "text_config",
+                        model.thinker.config)
+    rms_eps = float(getattr(text_cfg, "rms_norm_eps", 1e-6))
+    d_sink_t = torch.tensor(D_SINK_LLM, dtype=torch.long)
+    is_sink_per_layer: list = [None] * n_layers
+
+    def _make_sink_hook(layer_idx: int):
+        def _h(_module, _inp, out):
+            if is_sink_per_layer[layer_idx] is not None:
+                return out
+            hs = out[0] if isinstance(out, tuple) else out
+            if hs.shape[1] <= 1:
+                return out
+            x = hs[0, mod_start:mod_end].float()              # (n_modal, H)
+            rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + rms_eps)
+            normed_abs = (x / rms).abs()
+            d_t = d_sink_t.to(x.device)
+            sink_act = normed_abs[:, d_t].amax(dim=-1)        # (n_modal,)
+            is_sink_per_layer[layer_idx] = (sink_act >= TAU_SINK_LLM).cpu().numpy()
+            return out
+        return _h
+
+    def _make_hook(layer_idx: int):
+        def _hook(_module, _inp, out):
+            if not (isinstance(out, tuple) and len(out) > 1 and out[1] is not None):
+                return out
+            aw = out[1]                                       # (1, H, q, kv)
+            row = aw[0, :, -1, :].float().mean(dim=0).cpu().numpy()  # (kv,)
+            if layer_idx == 0:                                # new forward step
+                captured.append([None] * n_layers)
+            if captured:
+                captured[-1][layer_idx] = row
+            # Drop the heavy tensor so nothing downstream retains it.
+            return (out[0], None) + tuple(out[2:])
+        return _hook
+
+    handles = [
+        layer.self_attn.register_forward_hook(_make_hook(i))
+        for i, layer in enumerate(layers)
+    ]
+    sink_handles = [
+        layer.register_forward_hook(_make_sink_hook(i))
+        for i, layer in enumerate(layers)
+    ]
     try:
         with torch.inference_mode():
-            outputs = model.generate(
+            model.generate(
                 **inputs,
                 use_audio_in_video=use_aiv,
                 return_audio=False,
                 do_sample=False,
-                max_new_tokens=N_GEN,
-                output_attentions=True,
+                # Composite generate() shadows the generic max_new_tokens with
+                # thinker_max_new_tokens, so the cap must be set here. Decoding
+                # stops at EOS first; this is only a runaway ceiling.
+                thinker_max_new_tokens=max_gen_tokens,
+                output_attentions=True,      # makes the modules return weights
                 return_dict_in_generate=True,
             )
     except Exception as e:
+        if _is_oom(e):
+            print(
+                f"\n[FATAL] CUDA OOM generating attentions for {clip_path.name} "
+                f"(prompt_len={prompt_len}, modal_tokens={mod_end - mod_start}). "
+                f"Even with hook-based capture, one layer's (H x S x S) block "
+                f"exceeds GPU memory — shorten the sequence (fps/max_pixels) or "
+                f"spread layers across more GPUs; not a bad clip.",
+                file=sys.stderr,
+            )
+            raise
         return None, spans, f"generate:{e}"
+    finally:
+        for h in handles:
+            h.remove()
+        for h in sink_handles:
+            h.remove()
 
-    gen_attns = getattr(outputs, "attentions", None)
-    if gen_attns is None or len(gen_attns) == 0:
-        del outputs
+    if not captured:
         torch.cuda.empty_cache()
         return None, spans, "no_attentions"
 
-    n_steps = len(gen_attns)
-    n_layers = len(gen_attns[0])
+    n_steps = len(captured)
     n_llm = mod_end - mod_start
-    # Accumulate per-layer modal attention summed over generation steps.
+    # Accumulate per-layer modal attention + per-layer attention budget, both
+    # summed over generation steps.
     perlayer_modal_sum = np.zeros((n_layers, n_llm), dtype=np.float64)
-    budget = {"system": [], "modal": [], "query": [], "generated": []}
+    budget_layers = {sp: np.zeros(n_layers, dtype=np.float64)
+                     for sp in ("system", "modal", "query", "generated")}
+    span_items = (("system", "system"), ("modal", mod_key), ("query", "query"))
 
-    for s_idx, step in enumerate(gen_attns):
-        # Each layer's attention tensor may live on a different device under
-        # device_map="auto", so move every layer's last-query row to CPU before
-        # stacking. mean over heads → (kv_len,) per layer; stack → (n_layers, kv_len).
-        rows = [
-            step[L][0, :, -1, :].float().mean(dim=0).cpu()
-            for L in range(n_layers)
-        ]
-        arr = torch.stack(rows, dim=0).numpy()           # (n_layers, kv_len)
+    for s_idx, step_rows in enumerate(captured):
+        # step_rows: per-layer last-query attention rows (kv grows each step).
+        if any(r is None for r in step_rows):
+            torch.cuda.empty_cache()
+            return None, spans, "incomplete_capture"
+        arr = np.stack(step_rows, axis=0)                # (n_layers, kv_len)
         perlayer_modal_sum += arr[:, mod_start:mod_end]
-        # Cross-layer-averaged full row for the budget sanity check.
-        xlayer_full = arr.mean(axis=0)                   # (kv_len,)
-        for span_name, span_key in (
-            ("system", "system"), ("modal", mod_key), ("query", "query"),
-        ):
+        for span_name, span_key in span_items:
             if span_key in spans:
                 s, e = spans[span_key]
-                budget[span_name].append(float(xlayer_full[s:e].sum()))
-            else:
-                budget[span_name].append(0.0)
+                budget_layers[span_name] += arr[:, s:e].sum(axis=1)  # (n_layers,)
         gen_end = prompt_len + s_idx
-        budget["generated"].append(
-            float(xlayer_full[prompt_len:gen_end].sum()) if gen_end > prompt_len else 0.0
-        )
+        if gen_end > prompt_len:
+            budget_layers["generated"] += arr[:, prompt_len:gen_end].sum(axis=1)
 
     perlayer_attn = perlayer_modal_sum / n_steps         # mean over gen steps
-    xlayer_attn = perlayer_attn.mean(axis=0)             # mean over layers too
+    for sp in budget_layers:
+        budget_layers[sp] /= n_steps
 
-    del outputs
+    # Stack sink masks (n_layers, n_modal); fall back to all-False if any layer
+    # didn't capture (rare; e.g. if prompt_len was unexpectedly 1).
+    if all(s is not None for s in is_sink_per_layer):
+        is_sink_arr = np.stack(is_sink_per_layer, axis=0)
+    else:
+        is_sink_arr = np.zeros((n_layers, n_llm), dtype=bool)
+
     torch.cuda.empty_cache()
     return {
-        "xlayer_attn": xlayer_attn,
         "perlayer_attn": perlayer_attn,
-        "budget_per_step": budget,
+        "budget_layers": budget_layers,
         "N_llm": n_llm,
         "n_layers": n_layers,
+        "is_sink_per_layer": is_sink_arr,    # (n_layers, n_modal) bool, P_llm mask
     }, spans, None
 
 
@@ -342,6 +462,19 @@ def _wmean_attn(mean_attn, counts, mask) -> float:
     return float((a[ok] * w[ok]).sum() / w[ok].sum())
 
 
+def _wsum_attn(mean_attn, counts, mask) -> float:
+    """Total attention mass over the selected bins = Σ (mean_attn_b * count_b)
+    = Σ over tokens in the regime of their attention (the 'sum' version)."""
+    if mask is None or not np.any(mask):
+        return float("nan")
+    a = mean_attn[mask]
+    w = counts[mask].astype(np.float64)
+    ok = np.isfinite(a) & (w > 0)
+    if not ok.any():
+        return float("nan")
+    return float((a[ok] * w[ok]).sum())
+
+
 def _wpercentile(values, weights, q_frac) -> float:
     """Weighted percentile of `values` (q_frac in [0,1]) using the per-bin
     histogram (value = bin mean_norm, weight = bin token count). Accurate to
@@ -361,13 +494,11 @@ def _wpercentile(values, weights, q_frac) -> float:
 
 
 def compute_summary(b: dict) -> dict:
-    """Corrected propagation metrics.
+    """Propagation metrics for one (layer's) binned distribution.
 
     - high_low_ratio (robust): token-weighted mean_attn over the HIGH-norm
       regime (mean_norm > p95 AND bin count >= RELIABLE_MIN_TOKENS) divided by
-      the same over the LOW-norm regime (mean_norm < p50). Replaces the old
-      n_per_clip split, which collapsed to NaN because the first sub-1 bin sits
-      at the sparse low-norm edge, not in the high-norm tail.
+      the same over the LOW-norm regime (mean_norm < p50).
     - tail_ratio: top-`TAIL_TOPN` highest-norm reliable bins (token-weighted
       mean_attn) divided by token-weighted mean_attn of bins with norm < 50.
       This is the verdict driver.
@@ -393,7 +524,7 @@ def compute_summary(b: dict) -> dict:
     p50 = _wpercentile(mean_norm[populated], counts[populated], LOW_NORM_PCT / 100.0)
     p95 = _wpercentile(mean_norm[populated], counts[populated], HIGH_NORM_PCT / 100.0)
 
-    # Robust high/low ratio.
+    # Robust high/low ratio (reliable high bins only; kept for context).
     low_mask = populated & np.isfinite(mean_norm) & (mean_norm < p50)
     high_mask = (counts >= RELIABLE_MIN_TOKENS) & np.isfinite(mean_norm) & (mean_norm > p95)
     low_attn = _wmean_attn(mean_attn, counts, low_mask)
@@ -404,7 +535,18 @@ def compute_summary(b: dict) -> dict:
         else float("nan")
     )
 
-    # Tail-focused ratio (verdict driver).
+    # p95_ratio (classification input): mean_attn over tokens with norm > p95 ÷
+    # mean_attn over tokens with norm < p50, token-weighted. NO reliability
+    # filter (token weighting handles noise). Captures BROAD high-norm propagation.
+    high_pct_mask = populated & np.isfinite(mean_norm) & (mean_norm > p95)
+    high_pct_attn = _wmean_attn(mean_attn, counts, high_pct_mask)
+    p95_ratio = (
+        high_pct_attn / low_attn
+        if np.isfinite(low_attn) and low_attn > 0 and np.isfinite(high_pct_attn)
+        else float("nan")
+    )
+
+    # Tail-focused ratio (legacy comparison line).
     reli_idx = np.where(reliable)[0]
     top_idx = sorted(reli_idx, key=lambda i: mean_norm[i], reverse=True)[:TAIL_TOPN]
     top_mask = np.zeros_like(counts, dtype=bool)
@@ -415,6 +557,43 @@ def compute_summary(b: dict) -> dict:
     tail_ratio = (
         top3_attn / mean_low50
         if np.isfinite(mean_low50) and mean_low50 > 0 and np.isfinite(top3_attn)
+        else float("nan")
+    )
+
+    # PRIMARY metric — absolute-threshold propagation ratio (Sink-or-Not τ=100):
+    #   high regime = norm > 100, low regime = norm < 50, token-weighted.
+    # Reported in two forms: 'mean' (per-token preference, the verdict driver)
+    # and 'sum' (total attention MASS to high vs low; tiny because there are far
+    # fewer high-norm tokens). _wmean_attn over a regime's bins equals the exact
+    # token-level mean; _wsum_attn equals the exact token-level sum.
+    high_abs_mask = populated & np.isfinite(mean_norm) & (mean_norm > TAU_HIGH)
+    n_high_tokens = int(counts[high_abs_mask].sum())
+    n_low_tokens = int(counts[low50_mask].sum())
+    high_abs_mean = _wmean_attn(mean_attn, counts, high_abs_mask)
+    prop_ratio = (
+        high_abs_mean / mean_low50
+        if np.isfinite(mean_low50) and mean_low50 > 0 and np.isfinite(high_abs_mean)
+        else float("nan")
+    )
+    high_abs_sum = _wsum_attn(mean_attn, counts, high_abs_mask)
+    low_abs_sum = _wsum_attn(mean_attn, counts, low50_mask)
+    prop_ratio_sum = (
+        high_abs_sum / low_abs_sum
+        if np.isfinite(low_abs_sum) and low_abs_sum > 0 and np.isfinite(high_abs_sum)
+        else float("nan")
+    )
+    # Modality-relative alternative (norm > 2*median high cutoff; <50 low). Audio
+    # has few tokens > 100 absolute, so this characterizes it on its own scale.
+    rel_cut = 2.0 * p50 if np.isfinite(p50) else float("nan")
+    if np.isfinite(rel_cut):
+        high_rel_mask = populated & np.isfinite(mean_norm) & (mean_norm > rel_cut)
+    else:
+        high_rel_mask = np.zeros_like(counts, dtype=bool)
+    n_high_rel_tokens = int(counts[high_rel_mask].sum())
+    high_rel_mean = _wmean_attn(mean_attn, counts, high_rel_mask)
+    rel_ratio = (
+        high_rel_mean / mean_low50
+        if np.isfinite(mean_low50) and mean_low50 > 0 and np.isfinite(high_rel_mean)
         else float("nan")
     )
 
@@ -443,6 +622,14 @@ def compute_summary(b: dict) -> dict:
         high_attn=high_attn,
         low_attn=low_attn,
         high_low_ratio=high_low_ratio,
+        p95_ratio=p95_ratio,
+        prop_ratio=prop_ratio,
+        prop_ratio_sum=prop_ratio_sum,
+        n_high_tokens=n_high_tokens,
+        n_low_tokens=n_low_tokens,
+        rel_cut=rel_cut,
+        rel_ratio=rel_ratio,
+        n_high_rel_tokens=n_high_rel_tokens,
         top3_attn=top3_attn,
         mean_low50=mean_low50,
         tail_ratio=tail_ratio,
@@ -454,50 +641,177 @@ def compute_summary(b: dict) -> dict:
     )
 
 
-def verdict_for(metric: dict) -> tuple:
-    """Verdict from the tail-focused metric (top3_reliable_high / mean_low).
-    Returns (verdict_string, strength_tag in {'present','ambiguous','none'})."""
-    tr = metric["tail_ratio"]
-    if not np.isfinite(tr):
-        return (
-            "Indeterminate — no reliable high-norm bins to estimate the tail.",
-            "none",
-        )
-    if tr >= TAIL_PRESENT:
-        return (
-            f"Propagation present — high-norm tail attended {tr:.2f}x the "
-            f"low-norm (<50) regime.",
-            "present",
-        )
-    if tr >= TAIL_AMBIGUOUS:
-        return (
-            f"Weak / ambiguous — high-norm tail attention {tr:.2f}x the "
-            f"low-norm regime (between 1.0 and 1.5).",
-            "ambiguous",
-        )
-    return (
-        f"No propagation — high-norm tail attention {tr:.2f}x the low-norm "
-        f"regime (below 1.0).",
-        "none",
-    )
+def classify_layer(top3_ratio: float, p95_ratio: float) -> str:
+    """Two-metric pattern classification of one (modality, layer):
+        Sharp  — top3_ratio >= 2.0 AND p95_ratio >= 1.2 (extreme-tail
+                 concentration; classical Sink-or-Not-to-Sink)
+        Spread — p95_ratio >= 1.2 (broad high-norm propagation, distributed)
+        None   — otherwise (no propagation effect)."""
+    has95 = np.isfinite(p95_ratio) and p95_ratio >= P95_MIN
+    has_top3 = np.isfinite(top3_ratio) and top3_ratio >= TOP3_SHARP
+    if has_top3 and has95:
+        return "Sharp"
+    if has95:
+        return "Spread"
+    return "None"
 
 
-def framing_from_strengths(strengths: dict) -> str:
-    """Project framing from per-modality verdict tags."""
-    a = strengths.get("audio", "none")
-    v = strengths.get("video", "none")
-    a_prop, v_prop = (a == "present"), (v == "present")
-    if a_prop and v_prop:
-        return "(A) Both modalities propagate — symmetric two-population story"
-    if (not a_prop) and v_prop:
-        return (
-            "(B) Only video propagates clearly — asymmetric (audio-deficit) "
-            "framing"
-        )
-    return (
-        "(C) Neither propagates clearly — project becomes ASD refinement, "
-        "not Sink-or-Not-to-Sink extension"
-    )
+def _ranges_str(layers_sorted) -> str:
+    """Compress a sorted layer list into a range string, e.g. [1,2,3,5,6]→'1-3,5-6'."""
+    if not layers_sorted:
+        return "—"
+    parts, start, prev = [], layers_sorted[0], layers_sorted[0]
+    for L in layers_sorted[1:]:
+        if L == prev + 1:
+            prev = L
+            continue
+        parts.append(f"{start}-{prev}" if start != prev else f"{start}")
+        start = prev = L
+    parts.append(f"{start}-{prev}" if start != prev else f"{start}")
+    return ",".join(parts)
+
+
+def layer_band(layer) -> str:
+    """Layer-band classification of a peak. early=0-7 (encoder-propagation per
+    Sink-or-Not-to-Sink), mid=8-19, late=20+ (LLM-emerged, a novel finding)."""
+    if layer is None:
+        return "n/a"
+    if layer <= 7:
+        return "early"
+    if layer <= 19:
+        return "mid"
+    return "late"
+
+
+def describe_pattern(modality: str, peak: dict) -> str:
+    """One-sentence mechanistic read from the dominant pattern + its band."""
+    pat, pl, band = peak["pattern"], peak["peak_layer"], peak["band"]
+    shape = peak["shape"]
+    M = modality.capitalize()
+    if pat == "None" or pl is None:
+        return f"{M}: no propagation effect at any layer (absent)."
+    if pat == "Sharp":
+        kind = ("consistent with Sink-or-Not-to-Sink's encoder-propagation "
+                "prediction" if band == "early" else
+                "but late — would suggest LLM-emerged rather than encoder-propagated "
+                "sinks" if band == "late" else "at a middle layer")
+        return (f"{M}: {shape} — extreme-tail concentration peaks at L{pl} "
+                f"(top3={peak['peak_top3']:.2f}x, p95={peak['peak_p95']:.2f}x), {kind}.")
+    # Spread
+    return (f"{M}: {shape} — broad/distributed high-norm propagation (no extreme-tail "
+            f"concentration), peak at L{pl} (top3={peak['peak_top3']:.2f}x, "
+            f"p95={peak['peak_p95']:.2f}x).")
+
+
+def framing_from_peaks(peaks: dict) -> str:
+    """Framing from the per-modality dominant pattern + band."""
+    v, a = peaks.get("video", {}), peaks.get("audio", {})
+    v_sharp_early = (v.get("pattern") == "Sharp" and v.get("band") == "early")
+    if not v_sharp_early:
+        return ("(C) Video is not Sharp-early — no clean classical/asymmetric "
+                "split; project becomes an ASD refinement, not a "
+                "Sink-or-Not-to-Sink extension.")
+    a_pat, a_band = a.get("pattern"), a.get("band")
+    if a_pat == "Sharp" and a_band == "early":
+        return ("(A) Symmetric classical — both modalities show early Sharp "
+                "(extreme-tail) propagation; encoder-propagated sinks in both.")
+    if a_pat == "Spread":
+        return ("(B) Asymmetric mechanism — vision does extreme-tail register "
+                "propagation (early Sharp) while audio does distributed propagation "
+                "(Spread), possibly at different layers.")
+    if a_pat == "None":
+        return ("(B-strict) Asymmetric — vision propagates (early Sharp) but audio "
+                "does not propagate at all (None).")
+    return ("(C) Video Sharp-early but audio pattern (Sharp non-early) fits neither "
+            "A nor B; project becomes an ASD refinement.")
+
+
+# --------------------------------------------------------------------------
+# Per-layer metrics assembly
+# --------------------------------------------------------------------------
+
+def per_layer_metrics(per_bin: dict, n_layers_by_modality: dict) -> dict:
+    """metrics_by_modality[modality] = list (len n_layers) of metric dicts
+    (compute_summary output + 'layer', 'verdict', 'verdict_str'); None for any
+    missing layer."""
+    out: dict = {}
+    for modality in per_bin:
+        nL = n_layers_by_modality.get(modality)
+        if not nL:
+            continue
+        ms = []
+        for L in range(nL):
+            b = per_bin[modality].get(L)
+            if b is None:
+                ms.append(None)
+                continue
+            m = compute_summary(b)
+            m["layer"] = L
+            m["top3_ratio"] = m["tail_ratio"]
+            m["pattern"] = classify_layer(m["top3_ratio"], m["p95_ratio"])
+            ms.append(m)
+        out[modality] = ms
+    return out
+
+
+def _first_metric(ms):
+    for m in ms:
+        if m is not None:
+            return m
+    return None
+
+
+def _peak_of(ms, key):
+    """(peak_value, peak_layer) for metric `key` across layers (nan-safe)."""
+    cand = [(m[key], m["layer"]) for m in ms
+            if m is not None and np.isfinite(m.get(key, float("nan")))]
+    if not cand:
+        return (float("nan"), None)
+    return max(cand, key=lambda x: x[0])
+
+
+def peak_per_modality(metrics_by_modality: dict) -> dict:
+    """modality -> dominant pattern + peak layer + ranges + trajectory shape.
+
+    dominant pattern = Sharp if any layer is Sharp, else Spread if any Spread,
+    else None. The peak layer is the strongest layer of the dominant pattern
+    (Sharp → max top3_ratio; Spread → max p95_ratio)."""
+    peaks: dict = {}
+    for modality, ms in metrics_by_modality.items():
+        ms = [m for m in ms if m is not None]
+        sharp = [m["layer"] for m in ms if m["pattern"] == "Sharp"]
+        spread = [m["layer"] for m in ms if m["pattern"] == "Spread"]
+        none = [m["layer"] for m in ms if m["pattern"] == "None"]
+
+        if sharp:
+            dom = "Sharp"
+            peak_m = max((m for m in ms if m["pattern"] == "Sharp"),
+                         key=lambda m: (m["top3_ratio"] if np.isfinite(m["top3_ratio"]) else -np.inf))
+        elif spread:
+            dom = "Spread"
+            peak_m = max((m for m in ms if m["pattern"] == "Spread"),
+                         key=lambda m: (m["p95_ratio"] if np.isfinite(m["p95_ratio"]) else -np.inf))
+        else:
+            dom = "None"
+            peak_m = None
+
+        if peak_m is not None:
+            pl = peak_m["layer"]
+            band = layer_band(pl)
+            shape = f"{band}-{dom.lower()}"
+            peaks[modality] = dict(
+                pattern=dom, peak_layer=pl, band=band, shape=shape,
+                peak_top3=peak_m["top3_ratio"], peak_p95=peak_m["p95_ratio"],
+                sharp_layers=sorted(sharp), spread_layers=sorted(spread),
+                none_layers=sorted(none),
+            )
+        else:
+            peaks[modality] = dict(
+                pattern="None", peak_layer=None, band="n/a", shape="absent",
+                peak_top3=float("nan"), peak_p95=float("nan"),
+                sharp_layers=[], spread_layers=[], none_layers=sorted(none),
+            )
+    return peaks
 
 
 # --------------------------------------------------------------------------
@@ -548,18 +862,71 @@ def _plot_panel(ax, b: dict, title: str):
     ], loc="upper right", fontsize=9)
 
 
-def plot_primary_crosslayer(xl_bin: dict, out_path: Path):
-    """PRIMARY Figure 3A using cross-layer-averaged attention. xl_bin[modality]
-    is a bindict built from attention averaged over all layers + heads."""
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-    for ax, modality in zip(axes, ("audio", "video")):
-        if modality not in xl_bin or xl_bin[modality] is None:
-            ax.set_visible(False)
-            continue
-        _plot_panel(ax, xl_bin[modality], f"{modality.capitalize()} Encoder (all layers)")
+def plot_layer_trajectory(metrics_by_modality: dict, peaks: dict, out_path: Path):
+    """PRIMARY figure: one panel per modality. X = layer index. Thick line =
+    top3_ratio (extreme-tail); thin line = p95_ratio (broad). Each layer's marker
+    is colored by its two-metric pattern (Sharp=red, Spread=orange, None=gray) so
+    the classification is visible. Threshold lines at top3=2.0 and p95=1.2; the
+    dominant-pattern peak layer is starred."""
+    mods = [m for m in ("audio", "video") if m in metrics_by_modality]
+    if not mods:
+        return
+    fig, axes = plt.subplots(1, len(mods), figsize=(8 * len(mods), 5.2),
+                             squeeze=False)
+    for ax, modality in zip(axes[0], mods):
+        ms = [m for m in metrics_by_modality[modality] if m is not None]
+        layers = np.array([m["layer"] for m in ms])
+        top3 = np.array([m["top3_ratio"] for m in ms], dtype=float)
+        p95 = np.array([m["p95_ratio"] for m in ms], dtype=float)
+        pat_colors = [PATTERN_COLOR[m["pattern"]] for m in ms]
+
+        ax.plot(layers, top3, lw=2.4, color="#444444", zorder=2,
+                label="top3_ratio (extreme-tail)  [thick]")
+        ax.plot(layers, p95, lw=1.0, ls="--", color="#888888", alpha=0.8, zorder=2,
+                label="p95_ratio (broad)  [thin]")
+        # Pattern-colored markers on the top3 line.
+        ax.scatter(layers, top3, c=pat_colors, s=42, zorder=4,
+                   edgecolor="black", linewidth=0.3)
+        ax.axhline(TOP3_SHARP, ls="--", color="#d62728", lw=1.0, alpha=0.7,
+                   label=f"top3 Sharp threshold = {TOP3_SHARP}")
+        ax.axhline(P95_MIN, ls="--", color="#ff7f0e", lw=1.0, alpha=0.7,
+                   label=f"p95 propagation threshold = {P95_MIN}")
+        ax.axhline(1.0, ls="-", color="lightgray", lw=0.8, zorder=1)
+
+        pk = peaks.get(modality, {})
+        pl = pk.get("peak_layer")
+        if pl is not None:
+            yval = pk.get("peak_top3")
+            if not np.isfinite(yval):
+                yval = pk.get("peak_p95", 1.0)
+            ax.scatter([pl], [yval], color="black", marker="*", s=170, zorder=6)
+            ax.annotate(
+                f"peak L={pl}  ({pk['shape']})\n"
+                f"top3={pk['peak_top3']:.2f}x  p95={pk['peak_p95']:.2f}x",
+                xy=(pl, yval), xytext=(6, 8), textcoords="offset points",
+                fontsize=9, fontweight="bold",
+            )
+        ax.set_xlabel("LLM layer index", fontsize=11)
+        ax.set_ylabel("propagation ratio", fontsize=11)
+        ax.set_ylim(bottom=0)
+        ax.set_title(f"{modality.capitalize()} encoder — propagation by layer",
+                     fontsize=13)
+        ax.grid(True, linestyle=":", alpha=0.4)
+        # Classification-rule legend cell.
+        rule_handles = [
+            Line2D([0], [0], color="#444444", lw=2.4, label="top3_ratio (thick)"),
+            Line2D([0], [0], color="#888888", lw=1.0, ls="--", label="p95_ratio (thin)"),
+            Patch(facecolor=PATTERN_COLOR["Sharp"],
+                  label="Sharp: top3≥2.0 AND p95≥1.2"),
+            Patch(facecolor=PATTERN_COLOR["Spread"], label="Spread: p95≥1.2"),
+            Patch(facecolor=PATTERN_COLOR["None"], label="None: otherwise"),
+        ]
+        ax.legend(handles=rule_handles, loc="upper right", fontsize=8,
+                  title="pattern rule")
     fig.suptitle(
-        "Encoder norm vs LLM attention (averaged across all layers)",
-        fontsize=15, y=1.02,
+        "Per-layer encoder→LLM propagation trajectory "
+        "(two-metric pattern classification; markers colored by pattern)",
+        fontsize=14, y=1.02,
     )
     plt.tight_layout()
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
@@ -567,78 +934,21 @@ def plot_primary_crosslayer(xl_bin: dict, out_path: Path):
 
 
 def plot_layers_grid(per_bin: dict, layers, out_path: Path):
-    """TERTIARY supplementary figure: rows = the named layers, cols = modality."""
+    """SECONDARY figure: rows = representative layers, cols = modality."""
     layers = [l for l in layers]
-    fig, axes = plt.subplots(len(layers), 2, figsize=(16, 6 * len(layers)))
-    if len(layers) == 1:
-        axes = np.array([axes])
+    fig, axes = plt.subplots(len(layers), 2, figsize=(16, 6 * len(layers)),
+                             squeeze=False)
     for ri, layer_idx in enumerate(layers):
         for ci, modality in enumerate(("audio", "video")):
             ax = axes[ri][ci]
-            if modality not in per_bin or layer_idx not in per_bin[modality]:
+            if modality not in per_bin or layer_idx not in per_bin[modality] \
+                    or per_bin[modality][layer_idx] is None:
                 ax.set_visible(False)
                 continue
             _plot_panel(ax, per_bin[modality][layer_idx],
                         f"{modality.capitalize()} Encoder (layer {layer_idx})")
-    fig.suptitle("Per-layer breakdown (supplementary)", fontsize=15, y=1.005)
-    plt.tight_layout()
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_layer_trajectory(traj: dict, out_path: Path):
-    """SUPPLEMENTARY heatmap: x = layer index, y = norm bin (high-norm at top),
-    color = mean attention per (layer, bin), normalized within each layer
-    (per-column max). Only reliable bins (>=10 tokens) are shown; the rest are
-    masked. Reveals whether propagation is layer-localized or distributed."""
-    cmap = plt.get_cmap("viridis").copy()
-    cmap.set_bad("lightgray")
-    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
-    for ax, modality in zip(axes, ("audio", "video")):
-        if modality not in traj or traj[modality] is None:
-            ax.set_visible(False)
-            continue
-        t = traj[modality]
-        M = t["matrix"].astype(np.float64).copy()        # (n_bins, n_layers)
-        counts = t["bin_counts"]
-        centers = t["bin_centers"]
-        n_layers = M.shape[1]
-        # Mask unreliable bins (count identical across layers — same tokens).
-        M[counts < RELIABLE_MIN_TOKENS, :] = np.nan
-        # Restrict y to the populated-reliable range for legibility.
-        reli_rows = np.where(counts >= RELIABLE_MIN_TOKENS)[0]
-        if reli_rows.size == 0:
-            ax.set_visible(False)
-            continue
-        top_row = reli_rows.max()
-        M = M[: top_row + 1]
-        centers = centers[: top_row + 1]
-        # Per-layer (per-column) normalization by column max.
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", category=RuntimeWarning)
-            colmax = np.nanmax(M, axis=0, keepdims=True)
-        colmax[~np.isfinite(colmax) | (colmax == 0)] = 1.0
-        Mn = M / colmax
-        im = ax.imshow(
-            np.ma.masked_invalid(Mn), aspect="auto", origin="lower",
-            cmap=cmap, vmin=0.0, vmax=1.0,
-            extent=[-0.5, n_layers - 0.5, -0.5, len(centers) - 0.5],
-        )
-        ax.set_xlabel("LLM layer index", fontsize=11)
-        ax.set_ylabel("Encoder L2 norm", fontsize=11)
-        ystep = max(1, len(centers) // 12)
-        yt = np.arange(0, len(centers), ystep)
-        ax.set_yticks(yt)
-        ax.set_yticklabels([f"{centers[i]:.0f}" for i in yt])
-        ax.set_title(f"{modality.capitalize()} Encoder — attn(layer, norm bin)",
-                     fontsize=13)
-        cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        cb.set_label("per-layer-normalized mean attn", fontsize=10)
-    fig.suptitle(
-        "Layer trajectory of encoder-norm → LLM attention "
-        "(per-layer-normalized; high-norm at top)",
-        fontsize=14, y=1.02,
-    )
+    fig.suptitle("Figure 3A at representative layers (early / middle / late)",
+                 fontsize=15, y=1.005)
     plt.tight_layout()
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -648,7 +958,10 @@ def plot_layer_trajectory(traj: dict, out_path: Path):
 # Reporting (shared by full-run and --from_csv paths)
 # --------------------------------------------------------------------------
 
-DECISION_KEY = "all"            # cross-layer-averaged is the primary evidence
+def representative_layers(n_layers: int) -> list:
+    """Early / middle / late layer indices, clamped & de-duplicated."""
+    cand = [REP_EARLY, n_layers // 2, n_layers - REP_LATE_OFFSET]
+    return sorted({max(0, min(n_layers - 1, c)) for c in cand})
 
 
 def _bindict_from_group(g) -> dict:
@@ -673,43 +986,30 @@ def perbin_rows(modality, layer_label, b) -> list:
     } for i in range(b["n_bins"])]
 
 
-def load_per_bin_from_csv(summary_csv: Path, layers_csv: Path = None):
-    """Reconstruct per_bin[modality]['all'] from the cross-layer
-    propagation_summary.csv, and per_bin[modality][int] from the optional
-    per-layer propagation_layers.csv. Returns (per_bin, n_layers_by_modality)."""
-    df = pd.read_csv(summary_csv)
-    df["layer"] = df["layer"].astype(str)
-    if DECISION_KEY not in set(df["layer"]):
-        raise SystemExit(
-            f"{summary_csv} has no '{DECISION_KEY}' (cross-layer) rows — it "
-            "predates the cross-layer change. Re-run the full pipeline (no "
-            "--from_csv) to regenerate it."
-        )
+def load_per_layer_from_csv(layers_csv: Path):
+    """Reconstruct per_bin[modality][int] from propagation_layers.csv.
+    Returns (per_bin, n_layers_by_modality)."""
+    if not Path(layers_csv).exists():
+        raise SystemExit(f"{layers_csv} not found. Run the full pipeline first.")
+    dl = pd.read_csv(layers_csv)
     per_bin: dict = {}
-    for (modality, _), g in df[df["layer"] == DECISION_KEY].groupby(["modality", "layer"]):
-        per_bin.setdefault(modality, {})[DECISION_KEY] = _bindict_from_group(g)
-
-    n_layers_by_modality: dict = {}
-    if layers_csv and Path(layers_csv).exists():
-        dl = pd.read_csv(layers_csv)
-        for (modality, layer), g in dl.groupby(["modality", "layer"]):
-            per_bin.setdefault(modality, {})[int(layer)] = _bindict_from_group(g)
-        for modality in per_bin:
-            int_layers = [k for k in per_bin[modality] if isinstance(k, int)]
-            if int_layers:
-                n_layers_by_modality[modality] = max(int_layers) + 1
+    for (modality, layer), g in dl.groupby(["modality", "layer"]):
+        per_bin.setdefault(modality, {})[int(layer)] = _bindict_from_group(g)
+    n_layers_by_modality = {m: (max(per_bin[m]) + 1) for m in per_bin}
     return per_bin, n_layers_by_modality
 
 
-def print_top5_coverage(per_bin: dict):
+def print_top_coverage(per_bin: dict, n_layers_by_modality: dict):
+    """Top-5 high-norm bins by mean_norm (norm distribution is layer-independent,
+    so any populated layer's bins suffice)."""
     print("\n" + "=" * 78)
-    print("Top-5 high-norm bins by mean_norm (coverage check; norm dist is "
-          "layer-independent)")
+    print("Top-5 high-norm bins by mean_norm (coverage check)")
     print("=" * 78)
     for modality in per_bin:
-        b = per_bin[modality].get(DECISION_KEY)
-        if b is None:
+        layers = [L for L in per_bin[modality] if per_bin[modality][L] is not None]
+        if not layers:
             continue
+        b = per_bin[modality][layers[0]]
         valid = (b["bin_counts"] > 0) & np.isfinite(b["mean_norm"])
         order = np.argsort(np.where(valid, b["mean_norm"], -np.inf))[::-1][:5]
         print(f"\n  {modality}:")
@@ -723,211 +1023,411 @@ def print_top5_coverage(per_bin: dict):
             )
 
 
-def build_summary_rows(per_bin: dict, layers_to_report: list) -> list:
-    """layers_to_report: ordered list of keys, e.g. ['all', 2, 14]."""
-    rows = []
-    for modality in per_bin:
-        for layer_label in layers_to_report:
-            if layer_label not in per_bin[modality]:
-                continue
-            metric = compute_summary(per_bin[modality][layer_label])
-            rows.append({"modality": modality, "layer": layer_label, **metric})
-    return rows
-
-
-def print_summary_table(summary_rows: list):
+def print_and_save_per_layer_table(metrics_by_modality: dict, out_dir: Path):
+    """Per-layer table to stdout AND propagation_per_layer.csv."""
     def _f(v, fmt):
-        return fmt.format(v) if np.isfinite(v) else "  nan "
+        return fmt.format(v) if np.isfinite(v) else "   nan  "
 
-    print("\n" + "=" * 92)
-    print("Quantitative summary  (layer 'all' = cross-layer-averaged = PRIMARY; "
-          "2/14 supplementary)")
-    print("  high/low: norm>p95&reliable vs norm<p50 | tail3/low: top-3 reliable "
-          "hi-norm bins / norm<50")
-    print("=" * 92)
-    print(
-        f"{'modality':<9}{'layer':<6}{'reliable':<9}{'noisy':<7}"
-        f"{'pearson_r':<11}{'high/low':<10}{'tail3/low':<11}{'max_attn_norm':<14}"
-    )
-    print("-" * 92)
-    for r in summary_rows:
-        print(
-            f"{r['modality']:<9}{str(r['layer']):<6}{r['n_reliable_bins']:<9}"
-            f"{r['n_noisy_bins']:<7}"
-            f"{_f(r['pearson_r'], '{:+.3f} '):<11}"
-            f"{_f(r['high_low_ratio'], '{:.2f}x '):<10}"
-            f"{_f(r['tail_ratio'], '{:.2f}x '):<11}"
-            f"{_f(r['max_attn_bin_norm'], '{:.1f}'):<14}"
-        )
-
-
-def print_audio_characterization(summary_rows: list):
-    audio_rows = [r for r in summary_rows if r["modality"] == "audio"]
-    if not audio_rows:
-        return
-    print("\n" + "=" * 78)
-    print("Audio bimodal characterization (token-weighted mean_attn per window)")
-    print("=" * 78)
-
-    def _e(v):
-        return f"{v:.3e}" if np.isfinite(v) else "  nan  "
-
-    for r in audio_rows:
-        left, sec, tail = r["left_attn_0_10"], r["attn_60_100"], r["attn_gt_120"]
-        ratio = left / sec if np.isfinite(left) and np.isfinite(sec) and sec > 0 else float("nan")
-        print(
-            f"  layer {str(r['layer']):<4}:  leftmost(0-10)={_e(left)}   "
-            f"secondary(60-100)={_e(sec)}   high-tail(>120)={_e(tail)}"
-        )
-        if np.isfinite(ratio):
-            note = (
-                "leftmost >> secondary → positional sink dominates"
-                if ratio >= 2 else
-                "leftmost ~ secondary → no single dominant positional sink"
-            )
-            print(f"             leftmost/secondary = {ratio:.2f}x  ({note})")
-
-
-def write_metrics_csv(out_dir: Path, summary_rows: list):
+    print("\n" + "=" * 86)
+    print("Per-layer pattern classification  (Sharp: top3>=2.0 & p95>=1.2 | "
+          "Spread: p95>=1.2 | None)")
+    print("=" * 86)
+    print(f"{'modality':<9}{'layer':<6}{'pearson_r':<11}{'top3_ratio':<12}"
+          f"{'p95_ratio':<12}{'pattern':<9}")
+    print("-" * 86)
     rows = []
-    for r in summary_rows:
-        v, s = verdict_for(r)
-        rows.append({
-            "modality": r["modality"], "layer": r["layer"],
-            "is_primary": (r["layer"] == DECISION_KEY),
-            "n_reliable_bins": r["n_reliable_bins"],
-            "n_noisy_bins": r["n_noisy_bins"],
-            "pearson_r": r["pearson_r"],
-            "p50_norm": r["p50_norm"], "p95_norm": r["p95_norm"],
-            "low_attn": r["low_attn"], "high_attn": r["high_attn"],
-            "high_low_ratio": r["high_low_ratio"],
-            "top3_attn": r["top3_attn"], "mean_low50": r["mean_low50"],
-            "tail_ratio": r["tail_ratio"],
-            "top3_high_norms": ";".join(f"{x:.1f}" for x in r["top3_high_norms"]),
-            "max_attn_bin_norm": r["max_attn_bin_norm"],
-            "left_attn_0_10": r["left_attn_0_10"],
-            "attn_60_100": r["attn_60_100"],
-            "attn_gt_120": r["attn_gt_120"],
-            "strength": s,
-        })
-    path = out_dir / "propagation_metrics.csv"
-    pd.DataFrame(rows).to_csv(path, index=False)
-    print(f"wrote {path}")
-
-
-def build_trajectory(per_bin_modality: dict, n_layers: int) -> dict:
-    """(n_bins, n_layers) matrix of mean_attn per (bin, layer)."""
-    ref = per_bin_modality.get(0) or per_bin_modality.get(DECISION_KEY)
-    if ref is None:
-        return None
-    n_bins = ref["n_bins"]
-    M = np.full((n_bins, n_layers), np.nan)
-    for L in range(n_layers):
-        if L in per_bin_modality:
-            M[:, L] = per_bin_modality[L]["mean_attn"]
-    return dict(matrix=M, bin_centers=ref["bin_centers"],
-                bin_counts=ref["bin_counts"], n_layers=n_layers)
-
-
-def decide_and_write(summary_rows: list, out_dir: Path, n_clips: int,
-                     tertiary_layers, probed_layers_desc: str):
-    verdicts, strengths = {}, {}
-    for r in summary_rows:
-        if r["layer"] != DECISION_KEY:
+    for modality in ("audio", "video"):
+        ms = metrics_by_modality.get(modality)
+        if not ms:
             continue
-        v, s = verdict_for(r)
-        verdicts[r["modality"]] = v
-        strengths[r["modality"]] = s
-    framing = framing_from_strengths(strengths)
+        for m in ms:
+            if m is None:
+                continue
+            print(
+                f"{modality:<9}{m['layer']:<6}"
+                f"{_f(m['pearson_r'], '{:+.3f} '):<11}"
+                f"{_f(m['top3_ratio'], '{:.2f}x '):<12}"
+                f"{_f(m['p95_ratio'], '{:.2f}x '):<12}"
+                f"{m['pattern']:<9}"
+            )
+            rows.append({
+                "modality": modality, "layer": m["layer"],
+                "pearson_r": m["pearson_r"],
+                "top3_ratio": m["top3_ratio"],
+                "p95_ratio": m["p95_ratio"],
+                "pattern": m["pattern"],
+                "prop_ratio_mean": m["prop_ratio"],
+                "prop_ratio_sum": m["prop_ratio_sum"],
+                "rel_ratio": m["rel_ratio"],
+            })
+    path = out_dir / "propagation_per_layer.csv"
+    pd.DataFrame(rows).to_csv(path, index=False)
+    print(f"\nwrote {path}")
+
+
+def print_budget(budget_by_modality: dict, n_layers_by_modality: dict):
+    """Attention budget (system / modal / query / generated) at every 4th layer.
+    Each value is the fraction of a query row's attention landing on that span,
+    averaged over generated query positions and clips."""
+    print("\n" + "=" * 78)
+    print("Per-layer attention budget  (% of each query row, every 4th layer)")
+    print("=" * 78)
+    for modality, spans in budget_by_modality.items():
+        nL = n_layers_by_modality.get(modality, 0)
+        print(f"\n  {modality}:")
+        print(f"    {'layer':<7}{'system':>9}{'modal':>9}{'query':>9}{'generated':>11}")
+        for L in range(0, nL, 4):
+            def g(sp):
+                a = spans.get(sp)
+                return a[L] * 100 if a is not None and L < len(a) else float("nan")
+            mflag = "  ⚠ modal<1%" if np.isfinite(g("modal")) and g("modal") < 1.0 else ""
+            print(f"    {L:<7}{g('system'):>8.2f}%{g('modal'):>8.2f}%"
+                  f"{g('query'):>8.2f}%{g('generated'):>10.2f}%{mflag}")
+
+
+def decide_and_write(metrics_by_modality: dict, peaks: dict,
+                     n_layers_by_modality: dict, out_dir: Path, n_clips: int):
+    framing = framing_from_peaks(peaks)
+
+    def _modality_lines(modality) -> list:
+        """Reusable per-modality report lines (used for stdout and file)."""
+        pk = peaks[modality]
+        lines = [
+            f"{modality}: dominant pattern = {pk['pattern']}  (trajectory: {pk['shape']})",
+            f"  Sharp at L {_ranges_str(pk['sharp_layers'])}; "
+            f"Spread at L {_ranges_str(pk['spread_layers'])}; None elsewhere",
+        ]
+        if pk["peak_layer"] is not None:
+            lines.append(f"  peak layer L{pk['peak_layer']}: "
+                         f"top3={pk['peak_top3']:.2f}x, p95={pk['peak_p95']:.2f}x")
+        lines.append(f"  → {describe_pattern(modality, pk)}")
+        m0 = _first_metric(metrics_by_modality.get(modality, []))
+        if m0 is not None:
+            lines.append(f"  regime tokens: n(norm>100)={m0['n_high_tokens']}, "
+                         f"n(norm<50)={m0['n_low_tokens']}")
+            if modality == "audio":
+                rpr, rpl = _peak_of(metrics_by_modality[modality], "rel_ratio")
+                lines.append(f"  audio-relative (norm>{m0['rel_cut']:.0f}=2*median, "
+                             f"n={m0['n_high_rel_tokens']}): peak p95-style "
+                             f"{rpr:.2f}x at layer {rpl}")
+        return lines
 
     print("\n" + "=" * 78)
-    print("Per-modality verdicts  (PRIMARY = cross-layer-averaged attention)")
+    print("Pattern verdicts  (Sharp=extreme-tail | Spread=broad | None;  "
+          "band early 0-7 / mid 8-19 / late 20+)")
     print("=" * 78)
     for modality in ("audio", "video"):
-        if modality in verdicts:
-            print(f"  {modality}: {verdicts[modality]}")
+        if modality in peaks:
+            for ln in _modality_lines(modality):
+                print("  " + ln)
     print(f"\n  Framing recommendation: {framing}")
 
     with open(out_dir / "propagation_decision.txt", "w") as f:
-        f.write("Stage 1.2 — Encoder-to-LLM propagation (cross-layer primary)\n")
-        f.write("Primary metric: attention averaged across ALL layers + heads.\n")
-        f.write(f"Supplementary per-layer panels: {probed_layers_desc}\n")
-        f.write(f"n_clips/mod   : {n_clips}\n")
-        f.write("Verdict driver: tail_ratio = (top-3 reliable high-norm bins, "
-                "token-weighted mean_attn) / (mean_attn of norm<50 bins)\n")
-        f.write("  >=1.5 present | 1.0-1.5 ambiguous | <1.0 none\n\n")
+        f.write("Stage 1.2 — Encoder-to-LLM propagation (per-layer, two-metric)\n")
+        f.write("Per (modality, layer) pattern from TWO metrics:\n")
+        f.write("  top3_ratio = mean_attn(top-3 reliable hi-norm bins) / mean_attn(norm<50)\n")
+        f.write("  p95_ratio  = mean_attn(norm>p95) / mean_attn(norm<p50), token-weighted\n")
+        f.write("  Sharp: top3>=2.0 AND p95>=1.2 | Spread: p95>=1.2 | None: otherwise\n")
+        f.write("Band: early 0-7 (encoder-propagated) | mid 8-19 | late 20+ (LLM-emerged)\n")
+        f.write(f"n_clips/mod   : {n_clips}\n\n")
         for modality in ("audio", "video"):
-            if modality in verdicts:
-                f.write(f"{modality}: {verdicts[modality]}\n")
-        f.write(f"\nFraming recommendation: {framing}\n")
+            if modality in peaks:
+                f.write("\n".join(_modality_lines(modality)) + "\n\n")
+        f.write(f"Framing recommendation: {framing}\n")
     print(f"\nwrote {out_dir / 'propagation_decision.txt'}")
     print("\nStopping. Confirm the framing before Stage 1.3.")
 
 
-def report(per_bin: dict, n_layers_by_modality: dict, tertiary_layers,
-           out_dir: Path, n_clips: int, write_figures: bool = True):
-    """Shared reporting. PRIMARY evidence = cross-layer ('all'); layers in
-    `tertiary_layers` are a supplementary per-layer breakdown."""
-    tertiary_layers = [l for l in tertiary_layers]
-    report_layers = [DECISION_KEY] + tertiary_layers
+def report(per_bin: dict, n_layers_by_modality: dict, out_dir: Path,
+           n_clips: int, budget_by_modality: dict = None,
+           write_figures: bool = True):
+    """Shared reporting: per-layer metrics → table + figures + peak framing."""
+    metrics_by_modality = per_layer_metrics(per_bin, n_layers_by_modality)
+    peaks = peak_per_modality(metrics_by_modality)
 
-    print_top5_coverage(per_bin)
-    summary_rows = build_summary_rows(per_bin, report_layers)
-    print_summary_table(summary_rows)
-    print_audio_characterization(summary_rows)
-    write_metrics_csv(out_dir, summary_rows)
+    print_top_coverage(per_bin, n_layers_by_modality)
+    print_and_save_per_layer_table(metrics_by_modality, out_dir)
+    if budget_by_modality:
+        print_budget(budget_by_modality, n_layers_by_modality)
 
     if write_figures:
-        # PRIMARY: cross-layer Figure 3A.
-        xl_bin = {m: per_bin[m].get(DECISION_KEY) for m in per_bin}
-        p = out_dir / "figure_3a_crosslayer.png"
-        plot_primary_crosslayer(xl_bin, p)
+        # PRIMARY: per-layer tail-ratio trajectory.
+        p = out_dir / "figure_3a_layer_trajectory.png"
+        plot_layer_trajectory(metrics_by_modality, peaks, p)
         print(f"wrote {p}")
-        # SUPPLEMENTARY: layer trajectory heatmap.
-        traj = {}
-        for m in per_bin:
-            nl = n_layers_by_modality.get(m)
-            if nl:
-                traj[m] = build_trajectory(per_bin[m], nl)
-        if any(v is not None for v in traj.values()):
-            p = out_dir / "figure_3a_layer_trajectory.png"
-            plot_layer_trajectory(traj, p)
-            print(f"wrote {p}")
-        # TERTIARY: per-layer breakdown for the named layers.
-        if any(l in per_bin[m] for m in per_bin for l in tertiary_layers):
-            p = out_dir / "figure_3a_layers_2_14.png"
-            plot_layers_grid(per_bin, tertiary_layers, p)
-            print(f"wrote {p}")
+        # SECONDARY: Figure 3A at representative layers.
+        nL = max(n_layers_by_modality.values()) if n_layers_by_modality else 0
+        if nL:
+            reps = representative_layers(nL)
+            p = out_dir / "figure_3a_representative_layers.png"
+            plot_layers_grid(per_bin, reps, p)
+            print(f"wrote {p}  (layers {reps})")
 
-    desc = f"layers {tertiary_layers} (tertiary figure_3a_layers_2_14.png)"
-    decide_and_write(summary_rows, out_dir, n_clips, tertiary_layers, desc)
+    decide_and_write(metrics_by_modality, peaks, n_layers_by_modality,
+                     out_dir, n_clips)
 
 
 def run_from_csv(args):
-    """Recompute metrics/verdicts/framing (and regenerate figures) from existing
-    CSVs — no model load, no GPU. Needs the cross-layer propagation_summary.csv;
-    propagation_layers.csv (optional) enables the trajectory + per-layer figures."""
+    """Recompute metrics/verdicts/framing and regenerate figures from an
+    existing propagation_layers.csv — no model load, no GPU. The per-layer
+    attention budget is unavailable from CSV (it needs the forward pass)."""
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    summary_csv = Path(args.from_csv)
-    layers_csv = summary_csv.parent / "propagation_layers.csv"
-    print(f"--from_csv: recomputing from {summary_csv} (no model load)")
-    per_bin, n_layers_by_modality = load_per_bin_from_csv(summary_csv, layers_csv)
+    layers_csv = Path(args.from_csv)
+    if layers_csv.is_dir():
+        layers_csv = layers_csv / "propagation_layers.csv"
+    print(f"--from_csv: recomputing from {layers_csv} (no model load)")
+    per_bin, n_layers_by_modality = load_per_layer_from_csv(layers_csv)
     print(f"  modalities: {list(per_bin)}   n_layers: {n_layers_by_modality}")
-    report(per_bin, n_layers_by_modality, (args.layer_a, args.layer_b),
-           out_dir, args.n_clips, write_figures=True)
+    report(per_bin, n_layers_by_modality, out_dir, args.n_clips,
+           budget_by_modality=None, write_figures=True)
 
 
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
 
+# ----------------------------------------------------------------------
+# LLM-emerged sink (P_llm) aggregation + figures
+# ----------------------------------------------------------------------
+
+def aggregate_llm_emerged(per_clip_list: list) -> dict | None:
+    """Aggregate per-clip P_llm sink masks + attention received into per-layer
+    sink/non-sink attention means. per_clip_list is a list of dicts each with
+    'is_sink' (n_layers, n_modal) and 'perlayer_attn' (n_layers, n_modal)."""
+    if not per_clip_list:
+        return None
+    n_layers = per_clip_list[0]["perlayer_attn"].shape[0]
+    n_clips = len(per_clip_list)
+    sink_means    = np.full((n_layers, n_clips), np.nan)
+    nonsink_means = np.full((n_layers, n_clips), np.nan)
+    sink_counts   = np.zeros((n_layers, n_clips), dtype=np.int64)
+    total_counts  = np.zeros((n_layers, n_clips), dtype=np.int64)
+    for i, c in enumerate(per_clip_list):
+        is_sink = c["is_sink"].astype(bool)              # (n_layers, n_modal)
+        attn = c["perlayer_attn"]
+        total_counts[:, i] = is_sink.shape[1]
+        sink_counts[:, i] = is_sink.sum(axis=1)
+        for L in range(n_layers):
+            m = is_sink[L]
+            if m.any():
+                sink_means[L, i] = float(attn[L, m].mean())
+            if (~m).any():
+                nonsink_means[L, i] = float(attn[L, ~m].mean())
+    # Per-layer aggregates (mean over clips, ignoring NaN clips).
+    with np.errstate(invalid="ignore"):
+        layer_sink     = np.nanmean(sink_means, axis=1)
+        layer_sink_std = np.nanstd(sink_means, axis=1)
+        layer_nonsink  = np.nanmean(nonsink_means, axis=1)
+        layer_nonsink_std = np.nanstd(nonsink_means, axis=1)
+        layer_ratio = layer_sink / np.clip(layer_nonsink, 1e-12, None)
+    cross_sink    = float(np.nanmean(layer_sink))
+    cross_nonsink = float(np.nanmean(layer_nonsink))
+    cross_ratio   = cross_sink / max(cross_nonsink, 1e-12)
+    mean_sink_per_clip = sink_counts.mean(axis=1)
+    mean_total_per_clip = total_counts.mean(axis=1)
+    return dict(
+        n_clips=n_clips, n_layers=n_layers,
+        layer_sink=layer_sink, layer_sink_std=layer_sink_std,
+        layer_nonsink=layer_nonsink, layer_nonsink_std=layer_nonsink_std,
+        layer_ratio=layer_ratio,
+        crosslayer_sink=cross_sink, crosslayer_nonsink=cross_nonsink,
+        crosslayer_ratio=cross_ratio,
+        sink_count_per_layer=mean_sink_per_clip,
+        total_count_per_layer=mean_total_per_clip,
+        sink_means_per_clip=sink_means,        # (n_layers, n_clips) for later
+        nonsink_means_per_clip=nonsink_means,
+    )
+
+
+def llm_emerged_verdict(ratio: float) -> str:
+    if not np.isfinite(ratio):
+        return "n/a"
+    if ratio >= LLM_RATIO_PRESENT:
+        return "present"
+    if ratio >= LLM_RATIO_AMBIG:
+        return "ambiguous"
+    return "none"
+
+
+def plot_llm_emerged_crosslayer(stats_by_modality: dict, out_path: Path):
+    """Bar plot: cross-layer mean attn received, sink vs non-sink per modality,
+    with the ratio annotated above each pair."""
+    import matplotlib.pyplot as plt
+    mods = [m for m in ("audio", "video") if stats_by_modality.get(m)]
+    if not mods:
+        return
+    fig, ax = plt.subplots(figsize=(8, 5))
+    x = np.arange(len(mods))
+    w = 0.36
+    sinks    = [stats_by_modality[m]["crosslayer_sink"]    for m in mods]
+    nonsinks = [stats_by_modality[m]["crosslayer_nonsink"] for m in mods]
+    ratios   = [stats_by_modality[m]["crosslayer_ratio"]   for m in mods]
+    ax.bar(x - w / 2, sinks,    width=w, color="#d62728", alpha=0.9,
+           edgecolor="black", linewidth=0.5, label="sink-token mean attn")
+    ax.bar(x + w / 2, nonsinks, width=w, color="#9ecae1", alpha=0.9,
+           edgecolor="black", linewidth=0.5, label="non-sink mean attn")
+    for i, (s, ns, r) in enumerate(zip(sinks, nonsinks, ratios)):
+        top = max(s, ns) * 1.02
+        ax.text(i, top, f"ratio = {r:.2f}×  ({llm_emerged_verdict(r)})",
+                ha="center", fontweight="bold", fontsize=10)
+        ax.text(i - w / 2, s + max(s, ns) * 0.01, f"{s:.2e}",
+                ha="center", fontsize=8)
+        ax.text(i + w / 2, ns + max(s, ns) * 0.01, f"{ns:.2e}",
+                ha="center", fontsize=8)
+    ax.set_xticks(x); ax.set_xticklabels(mods)
+    ax.set_ylabel("mean attention received (averaged over layers)", fontsize=11)
+    ax.set_title("Stage 1.2 LLM-emerged sink (P_llm, D_sink={458,2570}, τ=20) — "
+                  "cross-layer", fontsize=11)
+    ax.grid(True, ls=":", alpha=0.4, axis="y"); ax.legend(fontsize=9)
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight"); plt.close(fig)
+    print(f"wrote {out_path}")
+
+
+def plot_llm_emerged_trajectory(stats_by_modality: dict, out_path: Path,
+                                 compare_layers=COMPARE_LAYERS_LLM):
+    """Per modality (2 panels): mean attn to sink (left y) and to non-sink, with
+    the per-layer ratio on the right y-axis. Compare layers marked vertically."""
+    import matplotlib.pyplot as plt
+    mods = [m for m in ("audio", "video") if stats_by_modality.get(m)]
+    if not mods:
+        return
+    fig, axes = plt.subplots(1, len(mods), figsize=(7 * len(mods), 5),
+                              squeeze=False)
+    axes = axes[0]
+    for ax, mod in zip(axes, mods):
+        s = stats_by_modality[mod]
+        Ls = np.arange(s["n_layers"])
+        ax.plot(Ls, s["layer_sink"], marker="o", ms=4, lw=2.0,
+                color="#d62728", label="sink-token mean attn")
+        ax.fill_between(Ls, s["layer_sink"] - s["layer_sink_std"],
+                         s["layer_sink"] + s["layer_sink_std"],
+                         color="#d62728", alpha=0.12)
+        ax.plot(Ls, s["layer_nonsink"], marker="o", ms=4, lw=2.0,
+                color="#9ecae1", label="non-sink mean attn")
+        ax.set_xlabel("LLM decoder layer L"); ax.set_ylabel("mean attention received")
+        ax.set_title(f"{mod}  (n_clips={s['n_clips']})", fontsize=12)
+        for L in compare_layers:
+            if 0 <= L < s["n_layers"]:
+                ax.axvline(L, ls=":", color="black", alpha=0.4)
+        ax_r = ax.twinx()
+        ax_r.plot(Ls, s["layer_ratio"], color="#2ca02c", lw=1.4, ls="--",
+                  label="ratio sink/non-sink")
+        ax_r.axhline(1.0, color="gray", ls=":", alpha=0.6)
+        ax_r.axhline(LLM_RATIO_PRESENT, color="#2ca02c", ls=":", alpha=0.5)
+        ax_r.set_ylabel("ratio sink / non-sink", color="#2ca02c")
+        ax_r.tick_params(axis="y", labelcolor="#2ca02c")
+        ax.grid(True, ls=":", alpha=0.4)
+        ax.legend(loc="upper left", fontsize=8)
+        ax_r.legend(loc="upper right", fontsize=8)
+    fig.suptitle("Stage 1.2 LLM-emerged sink (P_llm) — per-layer attention "
+                 "received  (dashed green = sink/non-sink ratio)",
+                 fontsize=11, y=1.02)
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight"); plt.close(fig)
+    print(f"wrote {out_path}")
+
+
+def plot_llm_emerged_layers(stats_by_modality: dict, out_path: Path,
+                             layers=COMPARE_LAYERS_LLM):
+    """Bar plot at the COMPARE_LAYERS_LLM layers: sink vs non-sink per layer
+    per modality, with ratios annotated."""
+    import matplotlib.pyplot as plt
+    mods = [m for m in ("audio", "video") if stats_by_modality.get(m)]
+    if not mods:
+        return
+    fig, axes = plt.subplots(1, len(mods), figsize=(6 * len(mods), 5),
+                              squeeze=False)
+    axes = axes[0]
+    w = 0.36
+    for ax, mod in zip(axes, mods):
+        s = stats_by_modality[mod]
+        xs = np.arange(len(layers))
+        sinks    = [s["layer_sink"][L]    for L in layers if L < s["n_layers"]]
+        nonsinks = [s["layer_nonsink"][L] for L in layers if L < s["n_layers"]]
+        ratios   = [s["layer_ratio"][L]   for L in layers if L < s["n_layers"]]
+        xs = xs[:len(sinks)]
+        ax.bar(xs - w / 2, sinks,    width=w, color="#d62728", alpha=0.9,
+               edgecolor="black", linewidth=0.5, label="sink mean attn")
+        ax.bar(xs + w / 2, nonsinks, width=w, color="#9ecae1", alpha=0.9,
+               edgecolor="black", linewidth=0.5, label="non-sink mean attn")
+        for i, (sv, nv, r) in enumerate(zip(sinks, nonsinks, ratios)):
+            top = max(sv, nv) * 1.02
+            ax.text(i, top, f"ratio = {r:.2f}×\n({llm_emerged_verdict(r)})",
+                    ha="center", fontweight="bold", fontsize=9)
+        ax.set_xticks(xs); ax.set_xticklabels([f"L{L}" for L in layers[:len(xs)]])
+        ax.set_ylabel("mean attention received")
+        ax.set_title(f"{mod}  (n_clips={s['n_clips']})", fontsize=11)
+        ax.grid(True, ls=":", alpha=0.4, axis="y"); ax.legend(fontsize=9)
+    fig.suptitle(f"Stage 1.2 LLM-emerged sink (P_llm) — at L{', L'.join(str(L) for L in layers)}",
+                 fontsize=11, y=1.02)
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight"); plt.close(fig)
+    print(f"wrote {out_path}")
+
+
+def write_llm_emerged_outputs(stats_by_modality: dict, out_dir: Path) -> str:
+    """Write the per-layer CSV + the 3 figures, return the decision-text block."""
+    # Per-layer CSV
+    rows = []
+    for mod, s in stats_by_modality.items():
+        if s is None: continue
+        for L in range(s["n_layers"]):
+            rows.append(dict(
+                modality=mod, layer=L,
+                sink_attn_mean=float(s["layer_sink"][L]),
+                sink_attn_std=float(s["layer_sink_std"][L]),
+                nonsink_attn_mean=float(s["layer_nonsink"][L]),
+                nonsink_attn_std=float(s["layer_nonsink_std"][L]),
+                ratio=float(s["layer_ratio"][L]),
+                mean_sink_count=float(s["sink_count_per_layer"][L]),
+                mean_total_count=float(s["total_count_per_layer"][L]),
+            ))
+    if rows:
+        pd.DataFrame(rows).to_csv(out_dir / "llm_emerged_per_layer.csv", index=False)
+        print(f"wrote {out_dir / 'llm_emerged_per_layer.csv'}")
+    plot_llm_emerged_crosslayer(stats_by_modality,
+                                 out_dir / "llm_emerged_crosslayer.png")
+    plot_llm_emerged_trajectory(stats_by_modality,
+                                 out_dir / "llm_emerged_trajectory.png")
+    plot_llm_emerged_layers(stats_by_modality,
+                             out_dir / "llm_emerged_layers_2_21.png")
+    # Decision-text block (returned so main can append to propagation_decision.txt)
+    lines = ["",
+             "=" * 80,
+             f"LLM-emerged sink track  (P_llm: D_sink={D_SINK_LLM}, τ={TAU_SINK_LLM})",
+             "  Question: do D_sink-activated LLM tokens receive more attention",
+             "  than non-D_sink tokens, layer by layer?  (vs Stage 1.2's primary",
+             "  question, which is about P_prop, the encoder-norm-defined population.)",
+             "=" * 80]
+    for mod, s in stats_by_modality.items():
+        if s is None: continue
+        v_cross = llm_emerged_verdict(s["crosslayer_ratio"])
+        lines.append(
+            f"  {mod}: cross-layer  sink_attn = {s['crosslayer_sink']:.3e},  "
+            f"nonsink_attn = {s['crosslayer_nonsink']:.3e},  "
+            f"ratio = {s['crosslayer_ratio']:.2f}×  → {v_cross}")
+        for L in COMPARE_LAYERS_LLM:
+            if 0 <= L < s["n_layers"]:
+                r = float(s["layer_ratio"][L])
+                lines.append(f"           L{L:<3d}  sink = {s['layer_sink'][L]:.3e}, "
+                              f"nonsink = {s['layer_nonsink'][L]:.3e}, "
+                              f"ratio = {r:.2f}×  → {llm_emerged_verdict(r)}")
+        n_sink_l21 = (s["sink_count_per_layer"][min(21, s["n_layers"]-1)]
+                       if s["n_layers"] > 21 else float("nan"))
+        n_sink_l2 = (s["sink_count_per_layer"][2] if s["n_layers"] > 2 else float("nan"))
+        lines.append(f"           mean sink tokens/clip:  L2 = {n_sink_l2:.1f},  "
+                      f"L21 = {n_sink_l21:.1f},  of ~"
+                      f"{s['total_count_per_layer'][0]:.0f} modal tokens")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def main(args):
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    tertiary_layers = (args.layer_a, args.layer_b)
-    print(f"Primary metric: cross-layer average over ALL layers.")
-    print(f"Tertiary per-layer panels: {tertiary_layers}")
+    print("Primary metric: per-layer tail_ratio trajectory over ALL layers.")
 
     print(f"Loading Stage 1.1 norms from {args.norms_npz}")
     cache = load_cache(Path(args.norms_npz))
@@ -955,22 +1455,26 @@ def main(args):
     thinker_cfg = _resolve_thinker_cfg(model)
 
     # ----- per-clip data collection -----
-    # per_modality[modality] = {"norms": [...], "xlayer": [...], "perlayer": [...]}
     #   norms:    list of (N_llm,)
-    #   xlayer:   list of (N_llm,)  cross-layer-averaged attention
     #   perlayer: list of (n_layers, N_llm)
+    #   is_sink:  list of (n_layers, N_llm) bool  (P_llm)
+    #   budget:   per span, list of (n_layers,) per-clip arrays
     per_modality: dict = {}
-    budget_pool: dict = {}                 # cross-layer per-span budgets
+    budget_pool: dict = {}
     n_layers_by_modality: dict = {}
+    span_names = ("system", "modal", "query", "generated")
+    # Parallel per-clip storage for the LLM-emerged (P_llm) track. Same clip
+    # order as per_modality; each entry holds {"is_sink", "perlayer_attn"}.
+    per_clip_llm: dict = {}
 
     for modality, entries in cache.items():
         modal_type = "a" if modality == "audio" else "v"
         clip_dir = Path(args.audio_dir if modality == "audio" else args.video_dir)
         sliced = entries if args.no_subset else entries[: args.n_clips]
         print(f"\n{modality} pass — {len(sliced)} clips, modal_type={modal_type!r}")
-        per_modality[modality] = {"norms": [], "xlayer": [], "perlayer": []}
-        budget_pool[modality] = {sp: [] for sp in ("system", "modal",
-                                                   "query", "generated")}
+        per_modality[modality] = {"norms": [], "perlayer": []}
+        per_clip_llm[modality] = []
+        budget_pool[modality] = {sp: [] for sp in span_names}
         tags: dict[str, int] = {}
         failures: dict[str, int] = {}
         first_verified = False
@@ -981,6 +1485,7 @@ def main(args):
                 continue
             result, spans, err = process_clip(
                 model, processor, clip_path, modal_type, thinker_cfg, tokenizer,
+                max_gen_tokens=args.max_gen_tokens,
             )
             if result is None:
                 failures[err] = failures.get(err, 0) + 1
@@ -1000,38 +1505,35 @@ def main(args):
                     f"    N_enc={len(cached_norms)}, N_llm={n_llm}, "
                     f"n_layers={result['n_layers']}, alignment={tag}\n"
                     f"    aligned_norms[:3] = {aligned[:3].tolist()}\n"
-                    f"    xlayer_attn[:3]   = {result['xlayer_attn'][:3].tolist()}"
+                    f"    perlayer_attn.mean(0)[:3] = "
+                    f"{result['perlayer_attn'].mean(0)[:3].tolist()}"
                 )
                 first_verified = True
 
             per_modality[modality]["norms"].append(aligned)
-            per_modality[modality]["xlayer"].append(result["xlayer_attn"])
             per_modality[modality]["perlayer"].append(result["perlayer_attn"])
-            for sp, vals in result["budget_per_step"].items():
-                budget_pool[modality][sp].extend(vals)
+            for sp in span_names:
+                budget_pool[modality][sp].append(result["budget_layers"][sp])
+            # P_llm: same per-clip alignment, just a parallel store
+            if "is_sink_per_layer" in result:
+                per_clip_llm[modality].append(dict(
+                    is_sink=result["is_sink_per_layer"],
+                    perlayer_attn=result["perlayer_attn"],
+                ))
         print(f"  alignment tags: {tags}")
         if failures:
             print(f"  failures: {failures}")
 
-    # ----- sanity: attention budget (cross-layer-averaged) -----
-    print("\n" + "=" * 78)
-    print("Attention budget sanity check  (cross-layer, per-(clip,query) mean, %)")
-    print("=" * 78)
+    # ----- per-layer attention budget (mean over clips) -----
+    budget_by_modality: dict = {}
     for modality in per_modality:
-        print(f"\n  {modality}:")
-        tot = 0.0
-        for sp in ("system", "modal", "query", "generated"):
-            vals = budget_pool[modality][sp]
-            if not vals:
-                continue
-            pct = float(np.mean(vals)) * 100
-            tot += pct
-            flag = "  ⚠ MODAL <1% — LLM is ignoring this modality" if (
-                sp == "modal" and pct < 1.0) else ""
-            print(f"    {sp:<10s}: {pct:6.2f}%{flag}")
-        print(f"    {'(sum)':<10s}: {tot:6.2f}%  (≈100% minus modal markers/header)")
+        bsp = budget_pool[modality]
+        budget_by_modality[modality] = {
+            sp: (np.mean(np.stack(v), axis=0) if v else None)
+            for sp, v in bsp.items()
+        }
 
-    # ----- per-bin stats: cross-layer ('all') + every layer -----
+    # ----- per-bin stats at EVERY layer -----
     per_bin: dict = {}
     for modality in per_modality:
         per_bin[modality] = {}
@@ -1040,33 +1542,42 @@ def main(args):
         if n_clips_used == 0:
             continue
         pooled_n = np.concatenate(norms_list)                       # (T,)
-        pooled_xl = np.concatenate(per_modality[modality]["xlayer"])  # (T,)
         pooled_pl = np.concatenate(
             per_modality[modality]["perlayer"], axis=1)             # (n_layers, T)
-        per_bin[modality][DECISION_KEY] = bin_norms_attn(
-            pooled_n, pooled_xl, n_clips_used, BIN_WIDTH)
         n_layers = n_layers_by_modality[modality]
         for L in range(n_layers):
             per_bin[modality][L] = bin_norms_attn(
                 pooled_n, pooled_pl[L], n_clips_used, BIN_WIDTH)
 
-    # ----- raw per-bin CSVs (read back by --from_csv) -----
-    summary_rows, layer_rows = [], []
+    # ----- raw per-bin CSV (read back by --from_csv) -----
+    layer_rows = []
     for modality in per_bin:
-        if DECISION_KEY in per_bin[modality]:
-            summary_rows += perbin_rows(modality, DECISION_KEY,
-                                        per_bin[modality][DECISION_KEY])
         for L in range(n_layers_by_modality.get(modality, 0)):
-            if L in per_bin[modality]:
+            if per_bin[modality].get(L) is not None:
                 layer_rows += perbin_rows(modality, L, per_bin[modality][L])
-    pd.DataFrame(summary_rows).to_csv(out_dir / "propagation_summary.csv", index=False)
     pd.DataFrame(layer_rows).to_csv(out_dir / "propagation_layers.csv", index=False)
-    print(f"\nwrote {out_dir / 'propagation_summary.csv'}  (cross-layer)")
-    print(f"wrote {out_dir / 'propagation_layers.csv'}  (per-layer, all layers)")
+    print(f"\nwrote {out_dir / 'propagation_layers.csv'}  (per-layer per-bin, all layers)")
 
-    # ----- coverage, metrics, figures, framing decision -----
-    report(per_bin, n_layers_by_modality, tertiary_layers, out_dir,
-           args.n_clips, write_figures=True)
+    # ----- coverage, per-layer table, budget, figures, framing -----
+    report(per_bin, n_layers_by_modality, out_dir, args.n_clips,
+           budget_by_modality=budget_by_modality, write_figures=True)
+
+    # ----- LLM-emerged (P_llm) track -----
+    print("\n" + "=" * 80)
+    print("LLM-emerged sink (P_llm) track — D_sink={458, 2570}, τ=20")
+    print("=" * 80)
+    llm_stats = {mod: aggregate_llm_emerged(per_clip_llm[mod])
+                 for mod in per_clip_llm if per_clip_llm[mod]}
+    if llm_stats:
+        block = write_llm_emerged_outputs(llm_stats, out_dir)
+        print(block)
+        # Append to the decision file so both verdicts live together.
+        dec_path = out_dir / "propagation_decision.txt"
+        with open(dec_path, "a") as f:
+            f.write(block + "\n")
+        print(f"appended LLM-emerged block to {dec_path}")
+    else:
+        print("  (no clips contributed P_llm data — skipping)")
 
 
 if __name__ == "__main__":
@@ -1086,18 +1597,15 @@ if __name__ == "__main__":
     )
     p.add_argument("--n_clips", type=int, default=300)
     p.add_argument(
+        "--max_gen_tokens", type=int, default=MAX_GEN_TOKENS,
+        help="Safety ceiling on generated tokens (passed as "
+             "thinker_max_new_tokens; the generic max_new_tokens is shadowed by "
+             "the composite generate). Decoding stops at EOS first, so this "
+             "rarely binds — captions are typically tens of tokens.",
+    )
+    p.add_argument(
         "--no_subset", action="store_true",
         help="Use ALL cached clips (overrides --n_clips slice).",
-    )
-    p.add_argument(
-        "--layer_a", type=int, default=2,
-        help="First layer for the TERTIARY per-layer breakdown figure "
-             "(default 2). No longer the decision layer — the verdict now uses "
-             "cross-layer-averaged attention.",
-    )
-    p.add_argument(
-        "--layer_b", type=int, default=14,
-        help="Second layer for the tertiary per-layer figure (default 14).",
     )
     p.add_argument(
         "--output_dir",
@@ -1105,17 +1613,15 @@ if __name__ == "__main__":
     )
     p.add_argument(
         "--device_map", default="balanced_low_0",
-        help="HF device_map. Default 'balanced_low_0' shards the model across "
-             "ALL visible GPUs and keeps GPU 0 light — required for 4-GPU runs, "
-             "since output_attentions on long video OOMs a single card. Plain "
-             "'auto' packs everything onto GPU 0. Auto-falls back to 'auto' if "
-             "only 1 GPU is visible.",
+        help="HF device_map. Default 'balanced_low_0' is the only multi-GPU map "
+             "that works on this model — plain 'auto'/'balanced' crash with a "
+             "cross-device mismatch. Auto-falls back to 'auto' on a single GPU.",
     )
     p.add_argument(
         "--max_memory_per_gpu", default=None,
         help="Optional per-GPU cap (e.g. '18GiB') forwarded as max_memory with "
-             "an additional CPU spill bucket. Use to fine-tune sharding if "
-             "balanced_low_0 still OOMs.",
+             "an additional CPU spill bucket. NOTE: capping changes placement and "
+             "can re-trigger the device-mismatch bug — leave unset unless needed.",
     )
     p.add_argument(
         "--cpu_memory", default="64GiB",
@@ -1123,8 +1629,9 @@ if __name__ == "__main__":
     )
     p.add_argument(
         "--from_csv", default=None,
-        help="Skip the model entirely and recompute metrics/verdicts/framing "
-             "from an existing propagation_summary.csv (no GPU).",
+        help="Skip the model entirely and recompute metrics/verdicts/framing + "
+             "figures from an existing propagation_layers.csv (no GPU). Accepts "
+             "the CSV path or its directory.",
     )
     args = p.parse_args()
     if args.from_csv:

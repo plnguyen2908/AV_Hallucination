@@ -85,6 +85,8 @@ def build_conversation(
     modal_type: str,
     video_fps: float = VIDEO_FPS_DEFAULT,
     video_max_pixels: int = VIDEO_MAX_PIXELS_DEFAULT,
+    resized_height: int = None,
+    resized_width: int = None,
 ) -> list:
     """Build the chat-template message list for one sample.
 
@@ -100,12 +102,18 @@ def build_conversation(
     if modal_type == "a":
         user_content.append({"type": "audio", "audio": media_path})
     elif modal_type in ("v", "av"):
-        user_content.append({
+        video_dict = {
             "type": "video",
             "video": media_path,
             "fps": video_fps,
-            "max_pixels": video_max_pixels,
-        })
+        }
+        if resized_height is not None and resized_width is not None:
+            # Bypass min_pixels assertion by specifying explicit resize dims.
+            video_dict["resized_height"] = resized_height
+            video_dict["resized_width"] = resized_width
+        else:
+            video_dict["max_pixels"] = video_max_pixels
+        user_content.append(video_dict)
     else:
         raise ValueError(f"Unknown modal_type: {modal_type!r}")
     user_content.append({"type": "text", "text": question})

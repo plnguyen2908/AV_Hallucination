@@ -1,0 +1,9 @@
+
+  /ralph-loop "Continue the Stage 5 autonomous exploration of training-free sink/attention-head interventions on AVHBench, per
+  /nobackup2/le/AV_Hallucination/results/qwen2_5_omni/stage5_intervention/_AUTONOMOUS_PLAN.md. Each iteration: (1) re-read the plan + activity log; (2) check method_log.md for any
+  newly-completed configs; (3) if the queue (_5_queue.py) is empty and no DEV-winner ≥ 80.0% exists, design 4-8 NEW configs that diversify on at least one new dimension (head subset,
+  layer band, value-zero, combined methods) and append them to _5_queue.py then relaunch it in the background; (4) when a DEV config reaches ≥80.0%, promote to --split FULL (5302
+  entries) for a TEST evaluation; (5) write RESULT_POS.md once TEST ≥ 81.22% is verified, RESULT_NEG.md if the stopping rule (30 DEV configs without a winner, or 3 failed TEST
+  replications) hits. Append a one-paragraph note to _AUTONOMOUS_PLAN.md every iteration. Output the completion phrase only when RESULT_POS.md exists and its TEST accuracy entry
+  shows >=81.22%." --completion-promise "AVHBench TEST accuracy >= 81.22% achieved and verified in RESULT_POS.md" 
+
