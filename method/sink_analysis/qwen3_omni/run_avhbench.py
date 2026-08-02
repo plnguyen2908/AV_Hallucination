@@ -209,7 +209,7 @@ def main(a):
     print(f"[shapes REVERSE] visual n={nv} shape_v[0,24,47]={shape_v[[0,24,47]].round(2)}", flush=True)
     print(f"[shapes REVERSE] av n={nav} shape_av[0,24,47]={shape_av[[0,24,47]].round(2)}", flush=True)
 
-    configs = [("baseline", None, None)]
+    configs = [] if a.skip_baseline else [("baseline", None, None)]
     for g in g_bases:
         for t in taus:
             configs.append((f"g{g}_tau{t}", g, t))
@@ -257,8 +257,9 @@ def main(a):
             bt = bytask[name].setdefault(r.task, [0, 0]); bt[0] += ok; bt[1] += 1
         torch.cuda.empty_cache()
         if (i + 1) % 25 == 0:
+            trk = configs[0][0]  # baseline if present, else first config
             print(f"  [{i+1}/{len(rows)}] {time.time()-t0:.0f}s "
-                  f"baseline={correct['baseline']/max(total['baseline'],1):.3f}", flush=True)
+                  f"{trk}={correct[trk]/max(total[trk],1):.3f}", flush=True)
 
     # router sanity by task
     rl = pd.DataFrame(router_log, columns=["task", "p_a", "p_v", "p_av"])
@@ -268,10 +269,10 @@ def main(a):
 
     print("\n=== RESULTS (AVHBench %s, %d inert heads, D_SINK schedule+router) ===" %
           (a.split, n_inert))
-    base = correct["baseline"] / max(total["baseline"], 1)
+    base = (correct["baseline"] / max(total["baseline"], 1)) if "baseline" in correct else None
     for name, *_ in configs:
         acc = correct[name] / max(total[name], 1)
-        d = "" if name == "baseline" else f"  (dbase {100*(acc-base):+.2f})"
+        d = "" if (name == "baseline" or base is None) else f"  (dbase {100*(acc-base):+.2f})"
         tk = " | ".join(f"{t[:12]}:{c[0]/max(c[1],1):.2f}" for t, c in sorted(bytask[name].items()))
         print(f"  {name:16s}: {acc:.4f}  n={total[name]}{d}   [{tk}]")
 
@@ -286,4 +287,7 @@ if __name__ == "__main__":
     p.add_argument("--heads_csv",
                    default=str(_REPO / "results/qwen3_omni/categorize_exp_4axis/heads.csv"))
     p.add_argument("--limit", type=int, default=0)
+    p.add_argument("--skip_baseline", action="store_true",
+                   help="Don't run the (config-independent) baseline config; "
+                        "reuse a previously measured baseline for the delta.")
     main(p.parse_args())
