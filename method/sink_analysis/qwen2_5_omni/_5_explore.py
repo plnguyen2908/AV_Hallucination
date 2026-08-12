@@ -62,6 +62,10 @@ TAU_PROP = 100.0
 DEFAULT_VIDEO_DIR = _REPO / "data/AVHBench/videos"
 DEFAULT_OUT = _REPO / "results/qwen2_5_omni/stage5_intervention"
 YES_NO_SUFFIX = " Answer with only 'Yes' or 'No'."
+# MAD's own prompt/sampling (MAD_reference/MAD/qwen-omni/utils.py).
+MAD_ANSWER_SUFFIX = (" Answer only 'Yes' or 'No'. "
+                     "Do not include any explanation.")
+MAD_FPS = 2.0        # library default: their video dict sets no fps
 
 TASK_TO_GT_MODALITY = {
     "Video-driven Audio Hallucination": "AUDIO",
@@ -466,6 +470,15 @@ def run_intervention(args, model, processor, layers, audio_enc, visual_enc,
         print(f"[schedule] loaded {args.gamma_schedule_npz}, g_base={args.g_base}, "
               f"nLayers={len(_sz['shape_a'])}", flush=True)
 
+    if getattr(args, 'limit', 0):
+        split_df = split_df.iloc[:args.limit]
+    if getattr(args, 'nshards', 1) > 1:
+        # Contiguous halves (not stride) so each shard's tqdm ETA is meaningful.
+        n = len(split_df); lo = (n * args.shard) // args.nshards
+        hi = (n * (args.shard + 1)) // args.nshards
+        split_df = split_df.iloc[lo:hi]
+        print(f"[shard {args.shard}/{args.nshards}] items {lo}:{hi} "
+              f"(n={len(split_df)})", flush=True)
     rows = []
     failures = 0
     t0 = time.time()
@@ -475,11 +488,34 @@ def run_intervention(args, model, processor, layers, audio_enc, visual_enc,
         vp = Path(args.video_dir) / f"{vid}.mp4"
         if not vp.exists():
             failures += 1; continue
-        prompt = r["text"] + YES_NO_SUFFIX
-        conv = build_conversation(str(vp), prompt, "av")
+        # --mad_prompt / --mad_sampling let ANY variant borrow MAD's prompt or
+        # its video sampling, to separate "MAD's decoder helps" from "MAD's
+        # prompt/sampling helps". Needed because MAD's AV-Matching gain
+        # coincides with the baseline's 15.4% yes-rate on a 50/50 task.
+        use_mad_prompt = args.variant == "mad" or args.mad_prompt
+        prompt = r["text"] + (MAD_ANSWER_SUFFIX if use_mad_prompt
+                              else YES_NO_SUFFIX)
+        if args.variant == "mad" or args.mad_sampling:
+            conv = build_conversation(str(vp), prompt, "av", video_fps=MAD_FPS,
+                                      video_max_pixels=None)
+        else:
+            conv = build_conversation(str(vp), prompt, "av")
         routed_mod = routed.get(r["question_id"], None) or \
                        TASK_TO_GT_MODALITY[r["task"]]  # fallback to gt
-        if args.variant == "none" and args.temperature_flatten is not None:
+        if args.variant == "mad":
+            # Opponent method (Kim et al., CVPR 2026). Reuses this harness's
+            # split/scoring/output; only the decode differs. Hyperparameters are
+            # the AUTHORS' defaults, NOT this project's: their conv passes no fps
+            # and no max_pixels (library defaults fps=2.0), their own answer
+            # suffix, gamma=2.5, 1 token. Their utils.py indexes step_logits by
+            # the weight keys, so the audio branch is REQUIRED -- we hand it the
+            # extracted wav (data/AVHBench/audios/<id>.wav).
+            from _5_avspeaker_mad import mad_decode
+            wav = Path(args.video_dir).parent / "audios" / f"{vid}.wav"
+            out = mad_decode(model, processor, prompt, str(vp), str(wav),
+                             str(vp), gamma=args.mad_gamma, max_new_tokens=1,
+                             fps=MAD_FPS, max_pixels=args.mad_max_pixels)
+        elif args.variant == "none" and args.temperature_flatten is not None:
             # KILL-SWITCH 2 — uniform pre-softmax temperature flattening.
             IV.set_intervention(dict(
                 mode="temperature_flatten",
@@ -637,7 +673,8 @@ def run_intervention(args, model, processor, layers, audio_enc, visual_enc,
     dt = time.time() - t0
     df = pd.DataFrame(rows)
     out_dir = Path(args.output_dir)
-    fname = f"interv_{args.tag}_{args.split.upper()}.csv"
+    sfx = f"_s{args.shard}of{args.nshards}" if getattr(args, "nshards", 1) > 1 else ""
+    fname = f"interv_{args.tag}{sfx}_{args.split.upper()}.csv"
     df.to_csv(out_dir / fname, index=False)
     overall = df.correct.mean() * 100
     per_task = df.groupby("task")["correct"].mean() * 100
@@ -648,12 +685,30 @@ def main(args):
     out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading model + patching attention ...")
-    model, processor = load_omni(args.model_path, device_map=args.device_map)
+    # MAD patches no attention, and at ITS sampling (fps=2.0, library max_pixels)
+    # the eager ViT score matrix alone is >4GB -> OOM on 24GB. Load SDPA for it;
+    # the authors use flash_attention_2 for the same reason. Every other variant
+    # needs eager so the intervention can read/modify attention weights.
+    model, processor = load_omni(
+        args.model_path, device_map=args.device_map,
+        attn_implementation="sdpa" if args.variant == "mad" else "eager")
+    if args.variant == "mad":
+        # Qwen2.5-Omni's ViT materialises a dense (seq x seq) block-diagonal
+        # mask even under SDPA -> 8.5GB at MAD's fps=2.0 sampling. The authors
+        # avoid it with flash-attn's varlen path, which will not build here;
+        # this block-SDPA loop is the numerically equivalent substitute.
+        from _5_efficient_encoders import patch_efficient_encoders
+        patch_efficient_encoders(model)
     layers = thinker_layers(model)
     eps_norm = _thinker_rms_eps(model)
     audio_enc, visual_enc = _resolve_encoders(model)
     d_sink_t = torch.tensor(D_SINK, dtype=torch.long)
-    IV.patch_qwen_attention(model)
+    if args.variant != "mad":
+        # MAD applies no intervention, and this patch swaps in an EAGER
+        # attention forward that materialises the full (S x S) softmax --
+        # 5.9GB at MAD's fps=2.0 sampling, i.e. instant OOM. Leaving the model
+        # unpatched keeps the SDPA kernel selected above.
+        IV.patch_qwen_attention(model)
     IV.clear_intervention()
 
     head_sets = load_head_sets(args.heads_csv)
@@ -737,6 +792,7 @@ if __name__ == "__main__":
                    choices=["DEV", "HELDOUT", "TEST", "FULL"])
     p.add_argument("--variant", required=True,
                    choices=["none",
+                              "mad",
                               "suppress_halluc_sink",
                               "suppress_inert_sink",
                               "boost_halluc_content",
@@ -755,7 +811,19 @@ if __name__ == "__main__":
                               "sink_to_nonsink_redistribute_inert",
                               "sink_to_nonsink_redistribute_halluc",
                               "sink_to_nonsink_redistribute_all_heads"])
+    p.add_argument("--shard", type=int, default=0)
+    p.add_argument("--nshards", type=int, default=1,
+                   help="split the split into N contiguous shards")
+    p.add_argument("--limit", type=int, default=0,
+                   help="score only the first N items (smoke tests)")
     p.add_argument("--gamma", type=float, required=True)
+    p.add_argument("--mad_prompt", action="store_true",
+                   help="control: use MAD's answer suffix with any variant")
+    p.add_argument("--mad_sampling", action="store_true",
+                   help="control: use MAD's fps=2.0 / library max_pixels")
+    p.add_argument("--mad_gamma", type=float, default=2.5)
+    p.add_argument("--mad_max_pixels", type=int, default=None,
+                   help="None = library default, as MAD itself uses")
     p.add_argument("--use_gt_routing", action="store_true",
                    help="Use AVHBench gt task label instead of router output. "
                          "Useful for isolating intervention effect from router.")

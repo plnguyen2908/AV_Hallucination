@@ -111,7 +111,9 @@ def build_conversation(
             # Bypass min_pixels assertion by specifying explicit resize dims.
             video_dict["resized_height"] = resized_height
             video_dict["resized_width"] = resized_width
-        else:
+        elif video_max_pixels is not None:
+            # None = omit the key = library default. MAD's own conversations set
+            # neither fps nor max_pixels, so its controls need this.
             video_dict["max_pixels"] = video_max_pixels
         user_content.append(video_dict)
     else:

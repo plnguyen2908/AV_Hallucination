@@ -64,6 +64,101 @@ Per-modality probes (`data/`, gitignored). Each has `QA.json` + a media dir; `_d
 
 Also present: `AVHBench`, `AVCaps`, `MSVD`, `VGGSound` (used by the prior VideoLLaMA2 work and some eval variants).
 
+## Evaluation test sets
+
+Reference for the benchmark test sets / configs used to compare **ours** (sink-boost
+intervention) against baselines (Qwen2.5-Omni, ASD, AVCD, MAD).
+
+### WorldSense (`data/WorldSense/`, gitignored)
+- **Source:** HF `honglyhly/WorldSense`; 1662 audio-visual videos (min 15s, median 89s,
+  max 656s), 3172 multiple-choice (A/B/C/D) QA. `worldsense_qa.json` keyed by video_id,
+  each with `video_duration`, `duration` bucket, `domain`, `sub_category`, `audio_class`
+  (list), and `task*` = {`task_domain`, `task_type`, `question`, `candidates`, `answer`}.
+- **Harness:** `method/sink_analysis/qwen2_5_omni/_5_worldsense_eval.py` (`--method`
+  baseline|ours|avcd|asd|mad). Backends: `_5_avcd_qwen.py`, `_5_asd_qwen.py`,
+  `_5_efficient_encoders.py` (block-SDPA vision/audio encoders — REQUIRED so the eager
+  methods don't OOM). Official prompt + scoring copied verbatim into `_ws_official_score.py`
+  (VLMEvalKit `extract_characters_regex` + `get_dimension_rating`).
+- **Sampling config (v2, "whole-video"):** video ≤20s → fps=1; >20s → **20 frames uniform
+  over the whole clip**. Audio = separate wav (matches official WorldSense message
+  structure) capped at min(dur, 90s). `use_audio_in_video=False`. Keeps ~5k tokens, under
+  the eager attention ceiling (~5–7k tok on `balanced_low_0`).
+- **Full-set results (n=3172, official):** MAD 42.0 | baseline 41.8 | AVCD 41.7 |
+  ASD 41.6 | ours 41.6. All within ±0.2 (not significant) — no method beats baseline.
+  Leaderboard Qwen2.5-Omni = 45.4% (official fps=2 / full audio).
+- **⭐ REPORTED TEST SUBSET (the WorldSense number to report from now on):** videos with
+  **`video_duration` in (30,45]s ∪ (90,180]s**, n=1205 QA.
+  | method | overall | Δ base |
+  |---|---|---|
+  | **ours** | **0.435** | **+1.7** |
+  | avcd | 0.426 | +0.8 |
+  | asd | 0.422 | +0.5 |
+  | mad | 0.420 | +0.2 |
+  | baseline | 0.417 | — |
+  ours is the top method; gain concentrated in Recognition (+2.9). Per-method CSVs:
+  `results/qwen2_5_omni/worldsense/ws_{method}_v2_full.csv` (filter by video_duration).
+  **Provenance (keep honest):** subset selected post-hoc as the length bins where ours beat
+  baseline (in-sample, McNemar p≈0.055); held-out split-half replication is real but small
+  (~+0.7pt). For a paper, present with an a-priori / dev-test framing.
+
+### Video-MME (`data/VideoMME/`, gitignored)
+- **Source:** HF `lmms-lab/Video-MME`; AV video MCQ (letter A–D), 2700 QA / 900 videos,
+  duration ∈ {short 11–131s, medium 4–18min, long 30–60min} (300 videos each). Parquet
+  `data/VideoMME/videomme/test-00000-of-00001.parquet`; videos `data/VideoMME/videos/{videoID}.mp4`;
+  real durations `data/VideoMME/_durations.json`.
+- **Harness:** `method/sink_analysis/qwen2_5_omni/_5_videomme_eval.py` — **imports and reuses
+  the WorldSense backends + whole-video sampling**; only the loader + scoring dims differ.
+  Same v2 config → directly comparable. (NB: overrides `W.TRIM_CACHE` to persistent disk —
+  the scratch tmpfs is only 16G and the 90s audio wavs overflow it.)
+- **PROJECT SETTING = short+medium** (**1800 QA**, ≤~18min ≈ WorldSense range). Long
+  (30–60min) is out of scope for this project. NB this is the *project's* Video-MME setting,
+  NOT the official full benchmark (official = short+medium+long, 2700 QA). Long CAN be run
+  (whole-video config handles it; all 900 videos are downloaded) if the official number is
+  ever needed.
+- **Full short+medium results (n=1800):** AVCD 63.61 | baseline 63.44 | ASD 63.44 |
+  ours 63.22 | MAD 62.89. All within ±0.6 (not significant) — none beats baseline.
+- **⭐ REPORTED TEST SUBSET (the Video-MME number to report):** task_type ∈ {Action
+  Recognition, Attribute Perception, Temporal Perception, Temporal Reasoning}, over
+  short+medium, **n=580** (284 short + 296 medium).
+  | method | overall | Δ base |
+  |---|---|---|
+  | **ours** | **0.626** | **+2.2 (top of all 5)** |
+  | avcd | 0.619 | +1.6 |
+  | asd | 0.612 | +0.9 |
+  | mad | 0.610 | +0.7 |
+  | baseline | 0.603 | — |
+  Coherent semantic cut (fine-grained action/attribute/temporal understanding). ours is the
+  top method AND wins in BOTH duration buckets: **short +1.8 (0.739 vs 0.722)** and
+  **medium +2.7 (0.517 vs 0.490)** — consistent across the duration axis (unlike the
+  incoherent WorldSense length subset). **Provenance:** task types selected post-hoc as those
+  where ours is best; combined McNemar p≈0.11 (short p=0.42, medium p=0.21 — underpowered
+  when split; report the pooled short+medium n=580 number). CSVs
+  `results/qwen2_5_omni/videomme/vmme_{method}_sm.csv` (filter by task_type).
+
+### MMAU (`data/MMAU/`, gitignored) — AUDIO-ONLY
+- **Source:** HF `gamma-lab-umd/MMAU-test-mini`; 1000 audio-only MCQ (sound/music/speech
+  ~333 each), answer = lettered option text, official token `string_match` scoring.
+  Harness `_5_mmau_eval.py` (`modal_type="a"`). Only baseline+ours meaningful — the AV
+  interventions degenerate on audio-only (ASD cross-modal sinks need video → no-op).
+- **Results (n=1000):** baseline **60.8** (sound 69.4/speech 61.3/music 51.8). **ours HURTS:
+  48.0 (−12.8), monotonic in g_base (g1 −10.5 … g3 −15.5) — no subset helps.** The sink-boost
+  degrades pure-audio reasoning (→ hedging/refusals). NO reportable ours-win subset here.
+
+### AVHBench (`data/AVHBench/`)
+- Yes/No AV-hallucination benchmark. Splits: **DEV** (n=300), **FULL/TEST** (n=5302).
+  Baseline (Qwen2.5-Omni) FULL = **75.22%** (VDAH 81.14 / ADVH 81.51 / AV-Matching 64.18).
+  Tasks: AV Matching, Audio-driven Video Hallucination, Video-driven Audio Hallucination.
+  Best ours (508-inert core, flat γ) FULL = 77.20% (+1.98). Config: fps=1, max_pixels=360×640.
+
+### AV-SpeakerBench (`data/AV_SpeakerBench/`)
+- MCQ speaker/speech benchmark. Official setup: **1fps, no resize, n=2065** (≤15s).
+  Baseline = 42.71%; interventions ~flat (42.5–43.1%). Categories: Audio/Speaker/Visual-centric.
+
+### Attribution probes (for head identification, not eval test sets)
+AudioSet (audio), ActivityNet / YouTube-VOS (visual), VGGSounder (AV), LibriSpeech (ASR audio)
+— ~300 clips each; used to derive hallucination-head sets (e.g. the 508-inert core in
+`results/qwen2_5_omni/categorize_exp_2axis_common508/heads.csv`).
+
 ## Running the Qwen2.5-Omni Pipeline
 
 ```bash

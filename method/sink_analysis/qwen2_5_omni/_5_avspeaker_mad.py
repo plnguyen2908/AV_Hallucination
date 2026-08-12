@@ -100,8 +100,12 @@ def mad_decode(model, processor, question, av_path, audio_path, visual_path,
     """
     # ---- 4 branch conversations ------------------------------------------
     def vid(path):
-        return {"type": "video", "video": path,
-                  "fps": fps, "max_pixels": max_pixels}
+        # max_pixels=None -> omit the key, i.e. the library default, which is
+        # what MAD's own conversations do (they set neither fps nor max_pixels).
+        d = {"type": "video", "video": path, "fps": fps}
+        if max_pixels is not None:
+            d["max_pixels"] = max_pixels
+        return d
 
     # av branch (= head; also used for routing)
     head_conv = [

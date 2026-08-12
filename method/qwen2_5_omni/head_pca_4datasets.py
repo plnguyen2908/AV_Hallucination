@@ -13,6 +13,35 @@ import os, sys
 from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
+
+# Paper-figure style, matched to head_umap_508.py / head_heatmap_4datasets.py:
+# no in-figure titles (captions carry them), serif text, large type (labels 30pt
+# / ticks 25pt), vector PDF + PNG, opaque white canvas.
+plt.rcParams.update({
+    "font.family": "serif",
+    "font.serif": ["Times New Roman", "Nimbus Roman", "DejaVu Serif"],
+    "mathtext.fontset": "stix",
+    "font.size": 25,
+    "axes.labelsize": 30,
+    "xtick.labelsize": 25,
+    "ytick.labelsize": 25,
+    "legend.fontsize": 20,
+    "axes.linewidth": 1.6,
+    "xtick.major.width": 1.6, "ytick.major.width": 1.6,
+    "xtick.major.size": 6, "ytick.major.size": 6,
+    "pdf.fonttype": 42, "ps.fonttype": 42,
+    "figure.facecolor": "white", "axes.facecolor": "white",
+    "savefig.facecolor": "white", "savefig.edgecolor": "none",
+    "savefig.transparent": False, "savefig.bbox": "tight",
+})
+
+
+def _save(fig, stem):
+    """PDF (vector, camera-ready) + PNG, both on an opaque white canvas."""
+    for ext in ("pdf", "png"):
+        fig.savefig(OUT / f"{stem}.{ext}", dpi=400, facecolor="white",
+                    edgecolor="none", transparent=False)
+
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 
@@ -74,19 +103,17 @@ def draw(ax):
                    edgecolors="k" if k else "none", linewidths=0.4,
                    alpha=0.35 if k == 0 else 0.9,
                    label=f"{k}  (n={m.sum()})", zorder=k + 1)
-    ax.set_xlabel(f"PC1 ({evr[0]*100:.1f}% var)", fontsize=12)
-    ax.set_ylabel(f"PC2 ({evr[1]*100:.1f}% var)", fontsize=12)
+    ax.set_xlabel(f"PC1 ({evr[0]*100:.1f}% var)")
+    ax.set_ylabel(f"PC2 ({evr[1]*100:.1f}% var)")
     ax.grid(alpha=0.25)
 
 # --- Figure 1: single scatter, categorical colors + legend ---
 fig, ax = plt.subplots(figsize=(9, 7.5))
 draw(ax)
-leg = ax.legend(title="# datasets flagging head", fontsize=10, title_fontsize=11,
+leg = ax.legend(title="# datasets flagging head", title_fontsize=22, frameon=False,
                 loc="upper right", framealpha=0.95)
-ax.set_title("Decoder heads — PCA of 4 proxy-dataset hallucination scores\n"
-             f"(n={n}; color/size = # datasets flagging the head, 0-4)", fontsize=12)
 fig.tight_layout()
-fig.savefig(OUT / "head_pca_4datasets.png", dpi=300)
+_save(fig, "head_pca_4datasets")
 print(f"\nwrote {OUT/'head_pca_4datasets.png'}")
 
 # --- Figure 2: faceted small-multiples, one panel per count level ---
@@ -98,15 +125,13 @@ for k in range(5):
     m = count == k
     a.scatter(P[m, 0], P[m, 1], c=COLORS[k], s=SIZES.get(k, 40) if k else 26,
               edgecolors="k", linewidths=0.4, alpha=0.95, zorder=2)
-    a.set_title(f"count = {k}   (n={m.sum()} heads)", fontsize=12,
+    a.set_title(f"count = {k}   (n={m.sum()} heads)", fontsize=24,
                 color=COLORS[k] if k else "black")
     a.grid(alpha=0.25)
 axes[5].axis("off")
-fig2.suptitle("Heads by # proxy datasets flagging them as hallucination-driving "
-              "(each panel highlights one count, all heads in gray)", fontsize=13)
 fig2.supxlabel(f"PC1 ({evr[0]*100:.1f}% var)"); fig2.supylabel(f"PC2 ({evr[1]*100:.1f}% var)")
 fig2.tight_layout()
-fig2.savefig(OUT / "head_pca_4datasets_facets.png", dpi=300)
+_save(fig2, "head_pca_4datasets_facets")
 print(f"wrote {OUT/'head_pca_4datasets_facets.png'}")
 
 # --- Per-modality PCA: 2 audio datasets -> 1 axis, 2 visual -> 1 axis ---
@@ -140,16 +165,13 @@ for k in range(5):
                 alpha=0.35 if k == 0 else 0.9,
                 label=f"{k}  (n={m.sum()})", zorder=k + 1)
 axm.axhline(0, color="gray", lw=0.6); axm.axvline(0, color="gray", lw=0.6)
-axm.legend(title="# datasets flagging head", fontsize=10, title_fontsize=11,
+axm.legend(title="# datasets flagging head", title_fontsize=22, frameon=False,
            loc="upper left", framealpha=0.95)
-axm.set_xlabel("Audio hallucination axis  (PC1 of AudioSet + LibriSpeech)", fontsize=12)
-axm.set_ylabel("Visual hallucination axis  (PC1 of ActivityNet + YouTube-VOS)", fontsize=12)
-axm.set_title("Decoder heads — audio vs visual hallucination axes\n"
-              f"(per-modality PCA of the 2 proxy datasets; color = # datasets flagging, 0-4)",
-              fontsize=11)
+axm.set_xlabel("Audio hallucination axis  (PC1 of AudioSet + LibriSpeech)")
+axm.set_ylabel("Visual hallucination axis  (PC1 of ActivityNet + YouTube-VOS)")
 axm.grid(alpha=0.25)
 figm.tight_layout()
-figm.savefig(OUT / "head_modality_axes.png", dpi=300)
+_save(figm, "head_modality_axes")
 print(f"wrote {OUT/'head_modality_axes.png'}")
 
 # --- Per-modality MIN of the 2 (z-scored) proxy datasets ---
@@ -167,16 +189,13 @@ for k in range(5):
                 alpha=0.35 if k == 0 else 0.9,
                 label=f"{k}  (n={m.sum()})", zorder=k + 1)
 axn.axhline(0, color="gray", lw=0.6); axn.axvline(0, color="gray", lw=0.6)
-axn.legend(title="# datasets flagging head", fontsize=10, title_fontsize=11,
+axn.legend(title="# datasets flagging head", title_fontsize=22, frameon=False,
            loc="upper left", framealpha=0.95)
-axn.set_xlabel("Audio axis  =  min(z[AudioSet], z[LibriSpeech])", fontsize=12)
-axn.set_ylabel("Visual axis  =  min(z[ActivityNet], z[YouTube-VOS])", fontsize=12)
-axn.set_title("Decoder heads — per-modality MIN of the 2 proxy datasets\n"
-              "(high axis = head drives hallucination in BOTH proxies of that modality)",
-              fontsize=11)
+axn.set_xlabel("Audio axis  =  min(z[AudioSet], z[LibriSpeech])")
+axn.set_ylabel("Visual axis  =  min(z[ActivityNet], z[YouTube-VOS])")
 axn.grid(alpha=0.25)
 fign.tight_layout()
-fign.savefig(OUT / "head_modality_min.png", dpi=300)
+_save(fign, "head_modality_min")
 print(f"wrote {OUT/'head_modality_min.png'}")
 
 # --- t-SNE (nonlinear) on the standardized 4D scores ---
@@ -194,15 +213,12 @@ for perp in (15, 30, 50):
                     edgecolors="k" if k else "none", linewidths=0.4,
                     alpha=0.35 if k == 0 else 0.9,
                     label=f"{k}  (n={m.sum()})", zorder=k + 1)
-    axt.legend(title="# datasets flagging head", fontsize=10, title_fontsize=11,
+    axt.legend(title="# datasets flagging head", title_fontsize=22, frameon=False,
                loc="best", framealpha=0.95)
     axt.set_xlabel("t-SNE 1"); axt.set_ylabel("t-SNE 2")
-    axt.set_title(f"Decoder heads — t-SNE of 4 proxy-dataset hallucination scores "
-                  f"(perplexity={perp})\ncolor/size = # datasets flagging the head (0-4)",
-                  fontsize=11)
     axt.grid(alpha=0.25)
     figt.tight_layout()
-    figt.savefig(OUT / f"head_tsne_p{perp}.png", dpi=300)
+    _save(figt, f"head_tsne_p{perp}")
     print(f"wrote {OUT/f'head_tsne_p{perp}.png'}")
 
 # Save the per-head table
